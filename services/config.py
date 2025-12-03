@@ -41,6 +41,7 @@ class AppState:
     solvision_score_threshold: Optional[float] = None
     solvision_nms_threshold: Optional[float] = None
     solvision_max_detections: Optional[int] = None
+    defect_score_threshold: Optional[float] = None
     # Persisted contour/edge tuning parameters for arrow computation
     contour_params: Optional[dict] = None
     # Step-2 square crop size (pixels)

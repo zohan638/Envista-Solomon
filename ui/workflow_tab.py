@@ -28,6 +28,8 @@ class WorkflowTab(QWidget):
     load_attachment_requested = pyqtSignal(str)
     load_front_requested = pyqtSignal(str)
     load_defect_requested = pyqtSignal(str)
+    run_step3_step4_requested = pyqtSignal()
+    defect_threshold_changed = pyqtSignal(float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -110,6 +112,40 @@ class WorkflowTab(QWidget):
         self.bt_detect = QPushButton("Run Detection")
         self.bt_detect.clicked.connect(self.run_detection_requested.emit)
         detect_layout.addWidget(self.bt_detect)
+        # Run only Step 3/4 on existing crops
+        self.bt_run_existing = QPushButton("Run Step 3/4 on Existing Run...")
+        self.bt_run_existing.clicked.connect(self.run_step3_step4_requested.emit)
+        detect_layout.addWidget(self.bt_run_existing)
+        # Defect threshold
+        thr_row = QHBoxLayout()
+        thr_row.addWidget(QLabel("Defect score threshold:"))
+        from PyQt5.QtWidgets import QDoubleSpinBox
+        self.spin_defect_thr = QDoubleSpinBox()
+        self.spin_defect_thr.setDecimals(3)
+        self.spin_defect_thr.setRange(0.0, 1.0)
+        self.spin_defect_thr.setSingleStep(0.01)
+        try:
+            st_thr = _state()
+            val = float(getattr(st_thr, "defect_score_threshold", None))
+            if val is None:
+                raise ValueError()
+        except Exception:
+            val = 0.5
+        self.spin_defect_thr.setValue(val)
+        thr_row.addWidget(self.spin_defect_thr, 1)
+        detect_layout.addLayout(thr_row)
+
+        def _persist_defect_thr(v):
+            try:
+                st = _state()
+                st.defect_score_threshold = float(v)
+                _save_state()
+                self.append_log(f"[Step4] Defect threshold set to {float(v):.3f}")
+                self.defect_threshold_changed.emit(float(v))
+            except Exception:
+                pass
+
+        self.spin_defect_thr.valueChanged.connect(_persist_defect_thr)
         # Optional: open edge/contour tuner dialog
         self.bt_tuner = QPushButton("Tune Edge/Contour…")
         self.bt_tuner.clicked.connect(self.open_tuner_requested.emit)

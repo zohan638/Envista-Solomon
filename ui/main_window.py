@@ -21,6 +21,9 @@ from services import turntable_service
 from services import linear_axis_service
 from services.config import settings, state, save_state
 from services import solvision_manager
+import concurrent.futures
+import os
+import cv2
 
 # Horizontal FOV of the front camera when measured inside the top-camera image (pixels)
 DEFAULT_FRONT_FOV_TOP_PX = 951.0
@@ -90,6 +93,11 @@ class MainWindow(QMainWindow):
         self.workflow_tab.load_attachment_requested.connect(self.on_load_attachment_file)
         self.workflow_tab.load_front_requested.connect(self.on_load_front_file)
         self.workflow_tab.load_defect_requested.connect(self.on_load_defect_file)
+        self.workflow_tab.run_step3_step4_requested.connect(self.on_run_step3_step4_existing)
+        try:
+            self.workflow_tab.defect_threshold_changed.connect(self.on_defect_threshold_changed)
+        except Exception:
+            pass
         
 
         self.preview_panel.overlay_toggled.connect(self.on_overlay_toggled)
@@ -268,8 +276,7 @@ class MainWindow(QMainWindow):
             pass
         # Require project
         try:
-            if not solvision_manager.has_loaded_project():
-                QMessageBox.information(self, "Run Detection", "Please load an attachment model first.")
+            if not self._ensure_models_loaded(required=("top", "front", "defect"), show_dialog=True):
                 return
         except Exception:
             pass
@@ -279,7 +286,6 @@ class MainWindow(QMainWindow):
         try:
             if camera_service.is_connected("Top"):
                 # Capture and write to captures folder for Detectron
-                import os, cv2
                 frame = cammgr.capture("Top")
                 # update preview immediately
                 pm = np_bgr_to_qpixmap(frame)
@@ -542,6 +548,54 @@ class MainWindow(QMainWindow):
         finally:
             pass
 
+    def on_run_step3_step4_existing(self):
+        """Run only step 3/4 on a previously captured run (step-02 crops)."""
+        from pathlib import Path
+        import threading
+
+        if not self._ensure_models_loaded(required=("front", "defect"), show_dialog=True):
+            return
+
+        base_dir = QFileDialog.getExistingDirectory(self, "Select Run Folder", "")
+        if not base_dir:
+            return
+        step2_dir = Path(base_dir) / "step-02"
+        crops_dir = step2_dir / "step_2_cropped"
+        if not step2_dir.exists() or not crops_dir.exists():
+            QMessageBox.information(
+                self,
+                "Run Step 3/4",
+                "Selected folder does not contain step-02/step_2_cropped.\n"
+                "Please select a run directory that has existing step-02 crops.",
+            )
+            return
+
+        def run():
+            try:
+                self.tt_message.emit(f"[Step3/4] Using existing run folder: {base_dir}")
+            except Exception:
+                pass
+            try:
+                self._run_step3_front(step2_dir)
+            except Exception as ex:
+                try:
+                    self.tt_message.emit(f"[Step3] Failed: {ex}")
+                except Exception:
+                    pass
+            try:
+                self._run_step4_defect(step2_dir)
+            except Exception as ex:
+                try:
+                    self.tt_message.emit(f"[Step4] Failed: {ex}")
+                except Exception:
+                    pass
+            try:
+                self.tt_message.emit("[Step3/4] Completed processing existing run.")
+            except Exception:
+                pass
+
+        threading.Thread(target=run, daemon=True).start()
+
     def on_open_tuner(self):
         try:
             from .edge_tuner import EdgeTunerDialog
@@ -749,6 +803,13 @@ class MainWindow(QMainWindow):
             step2_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
+        step3_dir = step2_dir.parent / 'step-03'
+        step4_dir = step2_dir.parent / 'step-04'
+        for _d in (step3_dir, step4_dir):
+            try:
+                _d.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
 
         # Order by index
         ordered = []
@@ -766,25 +827,74 @@ class MainWindow(QMainWindow):
             if not turntable_service.is_connected():
                 self.tt_message.emit("[Step2] Turntable not connected; skipping rotation sequence.")
                 return
-            # Load front model once, if provided
-            front_model = None
+            # Require models to be explicitly loaded by the user
+            front_model = solvision_manager.current_project_path_for('front')
+            defect_model = solvision_manager.current_project_path_for('defect')
             try:
                 from services.config import state as _state
-                st0 = _state()
-                if st0.front_attachment_path:
-                    front_model = st0.front_attachment_path
-                elif st0.defect_path:
-                    front_model = st0.defect_path
+                st_def = _state()
+                self._defect_thr_cached = getattr(st_def, "defect_score_threshold", None)
             except Exception:
-                front_model = None
-            # Prepare a dedicated 'front' detectron session if a model path is provided
-            if front_model:
+                self._defect_thr_cached = None
+            if not front_model:
+                self.tt_message.emit("[Step2] Front model not loaded; skipping rotation/front alignment.")
+                return
+
+            # Background executor to overlap step-03/04 with motions (single worker to keep Detectron safe)
+            exec_bg = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            bg_futures = []
+
+            def _submit_step4(bbox_path, idx):
+                if not bbox_path or not defect_model:
+                    return
                 try:
-                    solvision_manager.load_project_for('front', front_model)
-                    self.tt_message.emit(f"[Step2] Loaded front project in its own STA: {front_model}")
+                    f = exec_bg.submit(
+                        self._process_step4_single,
+                        bbox_path,
+                        idx,
+                        step4_dir,
+                        defect_model,
+                        self._defect_thr_cached,
+                    )
+                    bg_futures.append(f)
                 except Exception as ex:
-                    self.tt_message.emit(f"[Step2] Front project load failed: {ex}")
-                    front_model = None
+                    try:
+                        self.tt_message.emit(f"[Step4] idx {idx}: submit failed: {ex}")
+                    except Exception:
+                        pass
+
+            def _submit_step3(crop_path, idx):
+                if not crop_path or not front_model:
+                    return
+                try:
+                    f = exec_bg.submit(self._process_step3_single, crop_path, idx, step3_dir, front_model)
+                    bg_futures.append(f)
+                except Exception as ex:
+                    try:
+                        self.tt_message.emit(f"[Step3] idx {idx}: submit failed: {ex}")
+                    except Exception:
+                        pass
+                    return
+
+                def _on_done(fut, _idx=idx):
+                    try:
+                        bbox_path = None
+                        try:
+                            bbox_path = fut.result()
+                        except Exception as inner_ex:
+                            try:
+                                self.tt_message.emit(f"[Step3] idx {_idx}: failed: {inner_ex}")
+                            except Exception:
+                                pass
+                            return
+                        _submit_step4(bbox_path, _idx)
+                    except Exception:
+                        pass
+
+                try:
+                    f.add_done_callback(_on_done)
+                except Exception:
+                    pass
             # Snapshot helper (post to UI thread)
             def _show_front(frame):
                 try:
@@ -1089,6 +1199,10 @@ class MainWindow(QMainWindow):
                             out_path = str(crops_dir / f"step-02_front_crop_{idx:03d}.png")
                             _cv2.imwrite(out_path, crop_final)
                             self.tt_message.emit(f"[Step2] Saved corrected crop: {out_path}")
+                            try:
+                                _submit_step3(out_path, idx)
+                            except Exception:
+                                pass
                         except Exception as ex:
                             self.tt_message.emit(f"[Step2] Crop failed: {ex}")
 
@@ -1116,16 +1230,75 @@ class MainWindow(QMainWindow):
                 except Exception as ex:
                     self.tt_message.emit(f"[Step2] Snapshot failed: {ex}")
 
-            # Step 3: run front_attachment model over Step 2 crops and save outputs
+            # Wait for any pipelined Step3/4 tasks; fall back to sequential if none were scheduled
             try:
-                self._run_step3_front(step2_dir)
-            except Exception as ex:
-                self.tt_message.emit(f"[Step3] Failed: {ex}")
-            # Step 4: run defect model on Step 3 bbox crops
+                if bg_futures:
+                    try:
+                        while True:
+                            snapshot = list(bg_futures)
+                            pending = [f for f in snapshot if not f.done()]
+                            if not pending:
+                                break
+                            concurrent.futures.wait(pending, return_when=concurrent.futures.ALL_COMPLETED)
+                    except Exception:
+                        pass
+                    for fut in list(bg_futures):
+                        try:
+                            fut.result()
+                        except Exception as ex:
+                            try:
+                                self.tt_message.emit(f"[Step2] Background task failed: {ex}")
+                            except Exception:
+                                pass
+                else:
+                    # Backward-compatible sequential processing
+                    try:
+                        self._run_step3_front(step2_dir)
+                    except Exception as ex:
+                        self.tt_message.emit(f"[Step3] Failed: {ex}")
+                    try:
+                        self._run_step4_defect(step2_dir)
+                    except Exception as ex:
+                        self.tt_message.emit(f"[Step4] Failed: {ex}")
+            finally:
+                try:
+                    exec_bg.shutdown(wait=True)
+                except Exception:
+                    pass
+            # Fallback: ensure every bbox in step-03 has a step-04 result
+            try:
+                bbox_files = sorted(step3_dir.glob('step-03_front_bbox_*.png'))
+                for p in bbox_files:
+                    try:
+                        import re as _re
+                        m = _re.search(r"_(\d+)\.png$", p.name)
+                        idx_fallback = int(m.group(1)) if m else 0
+                    except Exception:
+                        idx_fallback = 0
+                    expected = step4_dir / f"step-04_defect_{idx_fallback:03d}.png"
+                    if expected.exists():
+                        continue
+                    try:
+                        self.tt_message.emit(f"[Step4] Fallback running idx {idx_fallback} from {p.name}")
+                    except Exception:
+                        pass
+                    try:
+                        self._process_step4_single(str(p), idx_fallback, step4_dir, defect_model, self._defect_thr_cached)
+                    except Exception as ex:
+                        try:
+                            self.tt_message.emit(f"[Step4] Fallback idx {idx_fallback} failed: {ex}")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            # Final sweep: rerun step-04 sequentially over all bboxes to guarantee outputs
             try:
                 self._run_step4_defect(step2_dir)
             except Exception as ex:
-                self.tt_message.emit(f"[Step4] Failed: {ex}")
+                try:
+                    self.tt_message.emit(f"[Step4] Final sweep failed: {ex}")
+                except Exception:
+                    pass
             # Home the turntable at the end
             try:
                 res = turntable_service.home()
@@ -1197,6 +1370,35 @@ class MainWindow(QMainWindow):
 
     def on_turntable_step_changed(self, v: float):
         st = state(); st.turntable_step = float(v); save_state()
+
+    def on_defect_threshold_changed(self, v: float):
+        try:
+            st = state()
+            st.defect_score_threshold = float(v)
+            save_state()
+            self.tt_message.emit(f"[Step4] Defect threshold updated to {float(v):.3f}")
+        except Exception:
+            pass
+
+    def _ensure_models_loaded(self, required=("top",), show_dialog=False) -> bool:
+        missing = []
+        try:
+            for name in required:
+                if solvision_manager.current_project_path_for(name) is None:
+                    missing.append(name)
+        except Exception:
+            missing = list(required)
+        if missing:
+            msg = f"Please load model(s): {', '.join(missing)} before running."
+            try:
+                if show_dialog:
+                    QMessageBox.information(self, "Models Required", msg)
+                else:
+                    self.workflow_tab.append_log(msg)
+            except Exception:
+                pass
+            return False
+        return True
 
     def _on_tt_raw_message(self, msg: str):
         # Called from service thread; relay to UI thread via signal
@@ -1421,6 +1623,217 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _process_step3_single(self, crop_path, idx, step3_dir, front_path):
+        import cv2 as _cv2
+        from services import solvision_manager
+
+        try:
+            if not front_path:
+                self.tt_message.emit("[Step3] No front_attachment model loaded; skipping.")
+                return None
+            if not os.path.isfile(crop_path):
+                self.tt_message.emit(f"[Step3] idx {idx}: crop not found: {crop_path}")
+                return None
+        except Exception:
+            return None
+
+        try:
+            img = _cv2.imread(str(crop_path))
+            if img is None:
+                self.tt_message.emit(f"[Step3] idx {idx}: failed to read {crop_path}")
+                return None
+            H, W = img.shape[:2]
+            dets = []
+            try:
+                dets = solvision_manager.detect_for('front', str(crop_path))
+            except Exception as ex:
+                self.tt_message.emit(f"[Step3] idx {idx}: detect failed: {ex}")
+                dets = []
+
+            if not dets:
+                ann = img.copy()
+                _cv2.putText(ann, 'No detection', (20, 40), _cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
+                out_ann = str(step3_dir / f"step-03_front_{idx:03d}.png")
+                _cv2.imwrite(out_ann, ann)
+                self.tt_message.emit(f"[Step3] idx {idx}: no detection; saved {out_ann}")
+                return None
+
+            cx0, cy0 = W * 0.5, H * 0.5
+
+            def _metric(d):
+                try:
+                    b = d.get('bounds') or d.get('rect') or None
+                    if not b or len(b) < 4:
+                        return (float('inf'), -0.0)
+                    x, y, w, h = b
+                    x = float(x); y = float(y); w = float(w); h = float(h)
+                    cx = x + w * 0.5; cy = y + h * 0.5
+                    dist2 = (cx - cx0) ** 2 + (cy - cy0) ** 2
+                    sc = float(d.get('score') or 0.0)
+                    return (dist2, -sc)
+                except Exception:
+                    return (float('inf'), -0.0)
+
+            best = min(dets, key=_metric)
+            bx, by, bw, bh = best.get('bounds') or (0, 0, 0, 0)
+            try:
+                bx = int(round(float(bx))); by = int(round(float(by)))
+                bw = int(round(float(bw))); bh = int(round(float(bh)))
+            except Exception:
+                bx, by, bw, bh = 0, 0, 0, 0
+            bx = max(0, min(W - 1, bx)); by = max(0, min(H - 1, by))
+            bw = max(0, min(W - bx, bw)); bh = max(0, min(H - by, bh))
+
+            ann = img.copy()
+            def _safe_label_pos(x, y, w, h, text):
+                (tw, th), _ = _cv2.getTextSize(text, _cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                lx = max(0, min(W - tw - 1, x + 4))
+                if y - th - 6 >= 0:
+                    ly = y - 6
+                else:
+                    ly = min(H - 6, y + h + th)
+                ly = max(th, min(H - 1, ly))
+                return lx, ly
+            def _hex_to_bgr(hex_str):
+                try:
+                    hs = hex_str.lstrip("#")
+                    if len(hs) == 6:
+                        r = int(hs[0:2], 16); g = int(hs[2:4], 16); b = int(hs[4:6], 16)
+                        return (b, g, r)
+                except Exception:
+                    pass
+                return (0, 255, 0)
+
+            color = _hex_to_bgr(best.get("color"))
+            _cv2.rectangle(ann, (bx, by), (bx + bw, by + bh), color, 2)
+            label = str(best.get('class') or '')
+            try:
+                sc = best.get('score')
+                if sc is not None:
+                    label = f"{label} {float(sc):.2f}" if label else f"{float(sc):.2f}"
+            except Exception:
+                pass
+            if label:
+                lx, ly = _safe_label_pos(bx, by, bw, bh, label)
+                _cv2.putText(ann, label, (lx, ly), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+            out_ann = str(step3_dir / f"step-03_front_{idx:03d}.png")
+            _cv2.imwrite(out_ann, ann)
+
+            pad = 50
+            x0 = max(0, bx - pad)
+            y0 = max(0, by - pad)
+            x1 = min(W, bx + bw + pad)
+            y1 = min(H, by + bh + pad)
+            if x1 <= x0 or y1 <= y0:
+                crop = img.copy()
+            else:
+                crop = img[y0:y1, x0:x1].copy()
+            out_crop = str(step3_dir / f"step-03_front_bbox_{idx:03d}.png")
+            _cv2.imwrite(out_crop, crop)
+            self.tt_message.emit(f"[Step3] idx {idx}: saved {out_ann} and bbox {out_crop}")
+            return out_crop
+        except Exception as ex:
+            try:
+                self.tt_message.emit(f"[Step3] idx {idx}: failed: {ex}")
+            except Exception:
+                pass
+            return None
+
+    def _process_step4_single(self, bbox_path, idx, step4_dir, defect_path, override_thr=None):
+        import cv2 as _cv2
+        from services import solvision_manager
+
+        try:
+            if not defect_path:
+                self.tt_message.emit("[Step4] No defect model loaded; skipping.")
+                return
+            if not os.path.isfile(bbox_path):
+                self.tt_message.emit(f"[Step4] idx {idx}: bbox not found: {bbox_path}")
+                return
+        except Exception:
+            return
+
+        try:
+            img = _cv2.imread(str(bbox_path))
+            if img is None:
+                self.tt_message.emit(f"[Step4] idx {idx}: failed to read {bbox_path}")
+                return
+            # Precompute palette once
+            palette_bgr = []
+            try:
+                cols = solvision_manager.class_colors_for('defect')
+                if cols:
+                    for hs in cols:
+                        try:
+                            hs = str(hs).lstrip("#").strip()
+                            if len(hs) == 6:
+                                r = int(hs[0:2], 16); g = int(hs[2:4], 16); b = int(hs[4:6], 16)
+                                palette_bgr.append((b, g, r))
+                        except Exception:
+                            continue
+            except Exception:
+                palette_bgr = []
+            if not palette_bgr:
+                # Hard fallback to known defect palette
+                for hs in ["#FCFF8A", "#7FD47F", "#ECA360", "#6AD0FF", "#4A4A4A"]:
+                    try:
+                        hs = hs.lstrip("#")
+                        if len(hs) == 6:
+                            r = int(hs[0:2], 16); g = int(hs[2:4], 16); b = int(hs[4:6], 16)
+                            palette_bgr.append((b, g, r))
+                    except Exception:
+                        continue
+            palette_fallback = palette_bgr[0] if palette_bgr else (255, 200, 0)
+            dets = []
+            try:
+                dets = solvision_manager.detect_for('defect', str(bbox_path), score_threshold=override_thr)
+            except Exception as ex:
+                self.tt_message.emit(f"[Step4] idx {idx}: detect failed: {ex}")
+                dets = []
+
+            ann = img.copy()
+            if not dets:
+                # No detections; still use palette color instead of red
+                _cv2.putText(ann, 'No defects', (20, 40), _cv2.FONT_HERSHEY_SIMPLEX, 1.0, palette_fallback, 2)
+            else:
+                for det in dets:
+                    b = det.get('bounds')
+                    if not b or len(b) < 4:
+                        continue
+                    x, y, w, h = b
+                    try:
+                        x = int(round(float(x))); y = int(round(float(y)))
+                        w = int(round(float(w))); h = int(round(float(h)))
+                    except Exception:
+                        continue
+                    try:
+                        cid = det.get("class_id")
+                        idx = int(cid) if cid is not None else 0
+                    except Exception:
+                        idx = 0
+                    if idx < 0 or idx >= len(palette_bgr):
+                        idx = 0
+                    color = palette_bgr[idx] if palette_bgr else palette_fallback
+                    _cv2.rectangle(ann, (x, y), (x + w, y + h), color, 2)
+                    label = str(det.get('class') or 'defect')
+                    try:
+                        sc = det.get('score')
+                        if sc is not None:
+                            label = f"{label} {float(sc):.2f}"
+                    except Exception:
+                        pass
+                    if label:
+                        _cv2.putText(ann, label, (x + 4, max(0, y - 6)), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+            out_ann = str(step4_dir / f"step-04_defect_{idx:03d}.png")
+            _cv2.imwrite(out_ann, ann)
+            self.tt_message.emit(f"[Step4] idx {idx}: saved {out_ann}")
+        except Exception as ex:
+            try:
+                self.tt_message.emit(f"[Step4] idx {idx}: failed: {ex}")
+            except Exception:
+                pass
     # ---- Step 3: run front-attachment detectron on step-02 crops ----
     def _run_step3_front(self, step2_dir):
         from pathlib import Path as _Path
@@ -1436,17 +1849,10 @@ class MainWindow(QMainWindow):
             self.tt_message.emit("[Step3] No step-02 crops found; skipping.")
             return
 
-        st = _state()
-        front_path = getattr(st, 'front_attachment_path', None)
+        # Require front model already loaded by user
+        front_path = solvision_manager.current_project_path_for('front')
         if not front_path:
-            self.tt_message.emit("[Step3] No front_attachment model configured; skipping.")
-            return
-
-        # Ensure dedicated 'front' session is ready and loaded
-        try:
-            solvision_manager.load_project_for('front', front_path)
-        except Exception as ex:
-            self.tt_message.emit(f"[Step3] Failed to load front model: {ex}")
+            self.tt_message.emit("[Step3] Front model not loaded; please load it before running Step 3.")
             return
 
         step3_dir = step2_dir.parent / 'step-03'
@@ -1506,7 +1912,31 @@ class MainWindow(QMainWindow):
                 bw = max(0, min(W - bx, bw)); bh = max(0, min(H - by, bh))
 
                 ann = img.copy()
-                color = (0, 255, 0)
+                def _safe_label_pos(x, y, w, h, text):
+                    # Clamp horizontally; prefer above box, else below while keeping inside image.
+                    (tw, th), _ = _cv2.getTextSize(text, _cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    lx = max(0, min(W - tw - 1, x + 4))
+                    if y - th - 6 >= 0:
+                        ly = y - 6
+                    else:
+                        ly = min(H - 6, y + h + th)
+                    ly = max(th, min(H - 1, ly))
+                    return lx, ly
+
+                def _color_from_meta(det_obj, role='front'):
+                    try:
+                        cid = det_obj.get("class_id")
+                        colors = solvision_manager.class_colors_for(role)
+                        if colors and cid is not None and 0 <= int(cid) < len(colors):
+                            hs = colors[int(cid)].lstrip("#")
+                            if len(hs) == 6:
+                                r = int(hs[0:2], 16); g = int(hs[2:4], 16); b = int(hs[4:6], 16)
+                                return (b, g, r)
+                    except Exception:
+                        pass
+                    return (0, 255, 0)
+
+                color = _color_from_meta(best, 'front')
                 _cv2.rectangle(ann, (bx, by), (bx + bw, by + bh), color, 2)
                 label = str(best.get('class') or '')
                 try:
@@ -1516,13 +1946,19 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
                 if label:
-                    _cv2.putText(ann, label, (bx + 4, max(0, by - 6)), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    lx, ly = _safe_label_pos(bx, by, bw, bh, label)
+                    _cv2.putText(ann, label, (lx, ly), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
                 out_ann = str(step3_dir / f"step-03_front_{idx:03d}.png")
                 _cv2.imwrite(out_ann, ann)
 
                 # Save bbox crop
-                crop = img[by:by + bh, bx:bx + bw].copy() if (bw > 0 and bh > 0) else img.copy()
+                pad = 50
+                x0 = max(0, bx - pad)
+                y0 = max(0, by - pad)
+                x1 = min(W, bx + bw + pad)
+                y1 = min(H, by + bh + pad)
+                crop = img[y0:y1, x0:x1].copy() if (x1 > x0 and y1 > y0) else img.copy()
                 out_crop = str(step3_dir / f"step-03_front_bbox_{idx:03d}.png")
                 _cv2.imwrite(out_crop, crop)
                 self.tt_message.emit(f"[Step3] idx {idx}: saved {out_ann} and bbox {out_crop}")
@@ -1548,22 +1984,53 @@ class MainWindow(QMainWindow):
             self.tt_message.emit("[Step4] No Step-03 bbox crops found; skipping.")
             return
 
+        from services.config import state as _state
         st = _state()
-        defect_path = getattr(st, 'defect_path', None)
-        if not defect_path:
-            self.tt_message.emit("[Step4] No defect model configured; skipping.")
-            return
-
-        try:
-            solvision_manager.load_project_for('defect', defect_path)
-        except Exception as ex:
-            self.tt_message.emit(f"[Step4] Failed to load defect model: {ex}")
+        defect_thr = getattr(st, 'defect_score_threshold', None)
+        defect_loaded_path = solvision_manager.current_project_path_for('defect')
+        if not defect_loaded_path:
+            self.tt_message.emit("[Step4] Defect model not loaded; please load it before running Step 4.")
             return
 
         try:
             step4_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
+
+        def _hex_to_bgr(hs):
+            try:
+                hs = str(hs).lstrip("#").strip()
+                if len(hs) == 6:
+                    r = int(hs[0:2], 16); g = int(hs[2:4], 16); b = int(hs[4:6], 16)
+                    return (b, g, r)
+            except Exception:
+                pass
+            return None
+
+        # Precompute palette from defect model metadata only (no fallbacks).
+        palette_bgr = []
+        try:
+            cols = solvision_manager.class_colors_for('defect')
+            if cols:
+                for hs in cols:
+                    c = _hex_to_bgr(hs)
+                    if c is not None:
+                        palette_bgr.append(c)
+        except Exception:
+            palette_bgr = []
+
+        def _color_for_det(det_obj):
+            # Prefer the exact color coming from Detectron metadata; otherwise map by class id if available.
+            c = _hex_to_bgr(det_obj.get('color'))
+            if c is not None:
+                return c
+            try:
+                cid = det_obj.get("class_id")
+                if palette_bgr and cid is not None and 0 <= int(cid) < len(palette_bgr):
+                    return palette_bgr[int(cid)]
+            except Exception:
+                pass
+            return None
 
         rx = _re.compile(r"step-03_front_bbox_(\d+)\.png$", _re.IGNORECASE)
         total = 0
@@ -1577,11 +2044,23 @@ class MainWindow(QMainWindow):
                 if img is None:
                     self.tt_message.emit(f"[Step4] idx {idx}: failed to read {p}")
                     continue
-                dets = solvision_manager.detect_for('defect', str(p))
+                H, W = img.shape[:2]
+                dets = solvision_manager.detect_for('defect', str(p), score_threshold=defect_thr)
                 ann = img.copy()
                 if not dets:
-                    _cv2.putText(ann, 'No defects', (20, 40), _cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                    if palette_bgr:
+                        _cv2.putText(ann, 'No defects', (20, 40), _cv2.FONT_HERSHEY_SIMPLEX, 1.0, palette_bgr[0], 2)
                 else:
+                    def _label_pos(x, y, w, h, text):
+                        # Keep text fully inside image: clamp horizontally and flip below when needed.
+                        (tw, th), _ = _cv2.getTextSize(text, _cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                        lx = max(0, min(W - tw - 1, x + 4))
+                        if y - th - 6 >= 0:
+                            ly = y - 6
+                        else:
+                            ly = min(H - 6, y + h + th)
+                        ly = max(th, min(H - 1, ly))
+                        return lx, ly
                     for det in dets:
                         b = det.get('bounds')
                         if not b or len(b) < 4:
@@ -1592,7 +2071,9 @@ class MainWindow(QMainWindow):
                             w = int(round(float(w))); h = int(round(float(h)))
                         except Exception:
                             continue
-                        color = (0, 0, 255)
+                        color = _color_for_det(det)
+                        if color is None:
+                            continue
                         _cv2.rectangle(ann, (x, y), (x + w, y + h), color, 2)
                         label = str(det.get('class') or 'defect')
                         try:
@@ -1602,7 +2083,8 @@ class MainWindow(QMainWindow):
                         except Exception:
                             pass
                         if label:
-                            _cv2.putText(ann, label, (x + 4, max(0, y - 6)), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                            lx, ly = _label_pos(x, y, w, h, label)
+                            _cv2.putText(ann, label, (lx, ly), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 out_ann = str(step4_dir / f"step-04_defect_{idx:03d}.png")
                 _cv2.imwrite(out_ann, ann)
                 self.tt_message.emit(f"[Step4] idx {idx}: saved {out_ann}")
