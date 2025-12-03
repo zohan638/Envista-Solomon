@@ -11,6 +11,7 @@ PyQt5 translation of the DemoApp UI that runs Detectron2 models directly (no .NE
 
 ## Prerequisites
 - Windows, Python 3.12 (existing env: `envistaEnv12`) or Python 3.8 (`envistaEnv`).
+- NVIDIA GPU with CUDA 12.6 runtime/driver already installed (the packaged build targets CUDA 12.6).
 - Packages: `PyQt5`, `numpy`, `opencv-python`, `torch`, `detectron2`, `pyserial`.
 - MindVision/iRAYPLE SDK installed (Python files + runtime):
   - Headers: `C:\Program Files\HuarayTech\MV Viewer\Development\Samples\Python\IMV\MVSDK\IMVApi.py` and `IMVDefines.py`
@@ -51,6 +52,17 @@ PyQt5 translation of the DemoApp UI that runs Detectron2 models directly (no .NE
 - `services/turntable_service.py` / `services/linear_axis_service.py` - serial control for motion hardware.
 - `ui/` - tabs, preview panel, tuner dialog, defect ledger, camera/turntable/axis panels.
 - `data_extractor.py` - utility to copy step-01/step-02 outputs into `captures_extracted/`.
+
+## Build a Windows exe
+- The build script pins the stack to CUDA 12.6: `torch==2.7.1`, `torchvision==0.22.1`, `torchaudio==2.7.1` from `https://download.pytorch.org/whl/cu126` and `detectron2==0.6+18f6958pt2.7.1cu126` from `https://miropsota.github.io/torch_packages_builder/detectron2/`. Ensure CUDA 12.6 runtime/drivers are present on the machine.
+- Local build (defaults cover the above; no extra args needed): `./scripts/build_exe.ps1 -Python python -OutputName EnvistaSolomon`. Output: `dist/EnvistaSolomon/EnvistaSolomon.exe` and `dist/EnvistaSolomon.zip`.
+- Overrides (rare): pass `-TorchIndex`, `-TorchVersion`, `-TorchVisionVersion`, `-TorchAudioVersion`, `-DetectronFindLinks`, or `-DetectronWheel` if you need a different CUDA/toolkit target.
+- The build script prunes `hydra/test_utils` from the PyInstaller output before zipping to avoid Windows file-lock issues; rerun the script if a zip step fails.
+- User data (logs, settings, captures) is written next to the exe so the packaged app runs outside the source tree.
+
+## Publish to GitHub Releases
+- Automated: trigger the `build-release-exe` workflow (Actions → build-release-exe). Inputs: `tag` (e.g., `v1.0.0`); other inputs default to the CUDA 12.6 stack above but can be overridden (`detectron_wheel_url`, `detectron_find_links`, `torch_index_url`, `python_version`). The workflow builds on `windows-latest`, uploads `EnvistaSolomon.zip`, and creates/updates the release for that tag.
+- Manual: after running the build script, tag and upload the zip: `git tag v1.0.0 && git push origin v1.0.0` then `gh release create v1.0.0 dist/EnvistaSolomon.zip -t "EnvistaSolomon v1.0.0" -n "Notes here"`.
 
 ## Tips
 - Models default to the `attachment` class; adjust `CLASS_NAMES` in `services/solvision_manager.py` if needed.

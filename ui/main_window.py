@@ -21,6 +21,7 @@ from services import turntable_service
 from services import linear_axis_service
 from services.config import settings, state, save_state
 from services import solvision_manager
+from services.app_paths import app_root
 import concurrent.futures
 import os
 import cv2
@@ -225,7 +226,6 @@ class MainWindow(QMainWindow):
 
     def on_run_detection(self):
         # Prepare capture directory structure based on date/time
-        from pathlib import Path
         from datetime import datetime
         import re
         part_id_raw = ""
@@ -255,7 +255,7 @@ class MainWindow(QMainWindow):
         cap_dir = None
         try:
             ts = datetime.now()
-            base = Path(__file__).resolve().parents[1] / 'captures' / part_id_clean
+            base = app_root() / 'captures' / part_id_clean
             cap_dir = base / ts.strftime('%Y-%m-%d') / ts.strftime('%H%M%S')
             cap_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
@@ -639,7 +639,7 @@ class MainWindow(QMainWindow):
                         pass
                     # Also write a temp file for convenience/inspection
                     try:
-                        base = _Path(__file__).resolve().parents[1]
+                        base = app_root()
                         tmp_path = str(base / "tuner_top.png")
                         _cv2.imwrite(tmp_path, frame)
                         chosen_path = tmp_path

@@ -1,0 +1,57 @@
+name: build-release-exe
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (e.g., v1.0.0)
+        required: true
+      detectron_wheel_url:
+        description: Full URL or path to the detectron2 wheel to install
+        required: false
+        default: detectron2==0.6+18f6958pt2.7.1cu126
+      detectron_find_links:
+        description: Find-links URL for detectron2 wheel
+        required: false
+        default: https://miropsota.github.io/torch_packages_builder/detectron2/
+      torch_index_url:
+        description: Torch index URL (CUDA 12.6)
+        required: false
+        default: https://download.pytorch.org/whl/cu126
+      python_version:
+        description: Python version used for the build
+        required: false
+        default: "3.10"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install dependencies and build exe
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          ./scripts/build_exe.ps1 -Python python -OutputName EnvistaSolomon -TorchIndex "${{ inputs.torch_index_url }}" -DetectronFindLinks "${{ inputs.detectron_find_links }}" -DetectronWheel "${{ inputs.detectron_wheel_url }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EnvistaSolomon-win
+          path: dist/EnvistaSolomon.zip
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: EnvistaSolomon ${{ inputs.tag }}
+          files: dist/EnvistaSolomon.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

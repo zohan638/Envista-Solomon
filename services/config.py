@@ -3,6 +3,8 @@ from typing import Optional, Any
 from pathlib import Path
 import json
 
+from .app_paths import user_file, ensure_parent
+
 
 @dataclass
 class InitSettings:
@@ -62,9 +64,8 @@ _state = AppState()
 
 
 def _state_path() -> Path:
-    # Store next to python_export as user_settings.json
-    base = Path(__file__).resolve().parents[1]
-    return base / "user_settings.json"
+    # Store next to the executable (or repo root during development)
+    return user_file("user_settings.json")
 
 
 def load_state() -> AppState:
@@ -84,7 +85,7 @@ def load_state() -> AppState:
 
 
 def save_state() -> None:
-    p = _state_path()
+    p = ensure_parent(_state_path())
     try:
         p.write_text(json.dumps(asdict(_state), ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:

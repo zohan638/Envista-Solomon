@@ -8,8 +8,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from .app_paths import user_file, ensure_parent
+
 # Crash log lives beside main.py so it is easy to find.
-LOG_PATH = Path(__file__).resolve().parents[1] / "crash.log"
+LOG_PATH = user_file("crash.log")
 
 _orig_sys_hook = None
 _orig_thread_hook = None
@@ -19,8 +21,8 @@ _faulthandler_file = None
 
 def _write_line(text: str) -> None:
     try:
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with LOG_PATH.open("a", encoding="utf-8") as f:
+        ensure_parent(LOG_PATH)
+        with Path(LOG_PATH).open("a", encoding="utf-8") as f:
             f.write(text + "\n")
     except Exception:
         # Never raise from crash logging.
@@ -90,6 +92,7 @@ def install(log_path: Optional[Path] = None) -> None:
 
     if log_path is not None:
         LOG_PATH = Path(log_path)
+    LOG_PATH = ensure_parent(Path(LOG_PATH))
 
     # Enable Python's faulthandler to capture hard crashes (segfaults).
     try:

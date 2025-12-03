@@ -28,6 +28,8 @@ build/
 *.swp
 *.swo
 *.orig
+*.diff
+*.patch
 
 # IDE / editor
 .vscode/
