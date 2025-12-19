@@ -32,11 +32,19 @@ class AppState:
     defect_path: Optional[str] = None
     camera_top_index: Optional[int] = None
     camera_front_index: Optional[int] = None
+    # PLC connection (Modbus TCP)
+    plc_host: Optional[str] = None
+    plc_port: Optional[int] = None
+    plc_unit_id: Optional[int] = None
+    # Legacy serial fields (kept for backward compatibility; unused with PLC setup)
     turntable_port: Optional[str] = None
     turntable_step: Optional[float] = None
     linear_axis_port: Optional[str] = None
     linear_axis_last_mm: Optional[float] = None
     linear_axis_home_mm: Optional[float] = None
+    # PLC actuator UI state (steps)
+    linear_axis_last_steps: Optional[int] = None
+    linear_axis_home_steps: Optional[int] = None
     overlay_enabled: Optional[bool] = None
     # Horizontal FOV of the front camera as measured in the top camera image (pixels)
     front_fov_top_px: Optional[float] = None

@@ -179,6 +179,14 @@ class EnvistaStatus:
 
     # system
     @property
+    def sys_cmd_seq(self) -> int:
+        return int(self.regs[O_SYS_CMD_SEQ]) & 0xFFFF
+
+    @property
+    def sys_ack_seq(self) -> int:
+        return int(self.regs[O_SYS_ACK_SEQ]) & 0xFFFF
+
+    @property
     def sys_cmd_word(self) -> int:
         return int(self.regs[O_SYS_CMD_WORD]) & 0xFFFF
 
@@ -199,6 +207,34 @@ class EnvistaStatus:
         return int(self.regs[O_SYS_PLC_HB]) & 0xFFFF
 
     @property
+    def sys_ready(self) -> bool:
+        return bool(self.sys_status_word & 0x0001)
+
+    @property
+    def sys_running(self) -> bool:
+        return bool(self.sys_status_word & 0x0002)
+
+    @property
+    def sys_fault(self) -> bool:
+        return bool(self.sys_status_word & 0x0004)
+
+    @property
+    def sys_halted(self) -> bool:
+        return bool(self.sys_status_word & 0x0008)
+
+    @property
+    def watchdog_ok(self) -> bool:
+        return bool(self.sys_status_word & 0x0010)
+
+    @property
+    def debug_enabled(self) -> bool:
+        return bool(self.sys_status_word & 0x0020)
+
+    @property
+    def allow_motion_active(self) -> bool:
+        return bool(self.sys_status_word & 0x0040)
+
+    @property
     def door_open(self) -> bool:
         return bool(self.sys_status_word & 0x0080)
 
@@ -207,6 +243,14 @@ class EnvistaStatus:
         return bool(self.sys_status_word & 0x0100)
 
     # actuator
+    @property
+    def act_cmd_seq(self) -> int:
+        return int(self.regs[O_ACT_CMD_SEQ]) & 0xFFFF
+
+    @property
+    def act_ack_seq(self) -> int:
+        return int(self.regs[O_ACT_ACK_SEQ]) & 0xFFFF
+
     @property
     def act_pos_steps(self) -> int:
         return unpack_dint_le(self.regs, O_ACT_POS_DINT)
@@ -236,6 +280,14 @@ class EnvistaStatus:
         return int(self.regs[O_ACT_FAULT_CODE]) & 0xFFFF
 
     # turntable
+    @property
+    def tt_cmd_seq(self) -> int:
+        return int(self.regs[O_TT_CMD_SEQ]) & 0xFFFF
+
+    @property
+    def tt_ack_seq(self) -> int:
+        return int(self.regs[O_TT_ACK_SEQ]) & 0xFFFF
+
     @property
     def tt_pos_deg(self) -> float:
         return unpack_dint_le(self.regs, O_TT_POS_DINT) / 1000.0
@@ -346,6 +398,7 @@ class EnvistaClient:
 
         self._client: Optional[ModbusTcpClient] = None
         self._last_status: Optional[EnvistaStatus] = None
+        self._lock = threading.RLock()
 
         self._hb_thread: Optional[threading.Thread] = None
         self._hb_stop = threading.Event()
@@ -362,58 +415,72 @@ class EnvistaClient:
 
     # --- pymodbus call compat ---
     def _call(self, fn_name: str, *args, **kwargs):
-        if self._client is None:
-            raise RuntimeError("Not connected")
-        fn = getattr(self._client, fn_name)
+        with self._lock:
+            if self._client is None:
+                raise RuntimeError("Not connected")
+            fn = getattr(self._client, fn_name)
 
-        for key in ("device_id", "unit", "slave"):
-            try:
-                kw = dict(kwargs)
-                kw[key] = self.unit_id
-                return fn(*args, **kw)
-            except TypeError:
-                continue
-        return fn(*args, **kwargs)
+            for key in ("device_id", "unit", "slave"):
+                try:
+                    kw = dict(kwargs)
+                    kw[key] = self.unit_id
+                    return fn(*args, **kw)
+                except TypeError:
+                    continue
+            return fn(*args, **kwargs)
 
     # --- connection ---
     def connect(self) -> None:
-        if self._client is not None:
-            return
-        self._client = ModbusTcpClient(self.host, port=self.port, timeout=self.timeout_s)
-        if not self._client.connect():
-            self._client = None
-            raise ConnectionError(f"Failed to connect to {self.host}:{self.port}")
+        with self._lock:
+            if self._client is not None:
+                return
+            self._client = ModbusTcpClient(self.host, port=self.port, timeout=self.timeout_s)
+            if not self._client.connect():
+                self._client = None
+                raise ConnectionError(f"Failed to connect to {self.host}:{self.port}")
 
     def close(self) -> None:
-        if self._client is None:
-            return
-        try:
-            self._client.close()
-        finally:
-            self._client = None
+        with self._lock:
+            if self._client is None:
+                return
+            try:
+                self._client.close()
+            finally:
+                self._client = None
 
     # --- low-level read/write ---
     def read_holding(self, address: int, count: int) -> List[int]:
-        rr = self._call("read_holding_registers", int(address), count=int(count))
-        if rr is None or getattr(rr, "isError", lambda: True)():
-            raise IOError(f"read_holding_registers failed at {address} count={count}: {rr}")
-        return list(rr.registers)  # type: ignore[attr-defined]
+        with self._lock:
+            rr = self._call("read_holding_registers", int(address), count=int(count))
+            if rr is None or getattr(rr, "isError", lambda: True)():
+                raise IOError(f"read_holding_registers failed at {address} count={count}: {rr}")
+            return list(rr.registers)  # type: ignore[attr-defined]
 
     def write_reg(self, address: int, value: int) -> None:
-        rr = self._call("write_register", int(address), int(value) & 0xFFFF)
-        if rr is None or getattr(rr, "isError", lambda: True)():
-            raise IOError(f"write_register failed at {address}: {rr}")
+        with self._lock:
+            rr = self._call("write_register", int(address), int(value) & 0xFFFF)
+            if rr is None or getattr(rr, "isError", lambda: True)():
+                raise IOError(f"write_register failed at {address}: {rr}")
 
     def write_regs(self, address: int, values: List[int]) -> None:
-        rr = self._call("write_registers", int(address), [int(v) & 0xFFFF for v in values])
-        if rr is None or getattr(rr, "isError", lambda: True)():
-            raise IOError(f"write_registers failed at {address}: {rr}")
+        with self._lock:
+            rr = self._call("write_registers", int(address), [int(v) & 0xFFFF for v in values])
+            if rr is None or getattr(rr, "isError", lambda: True)():
+                raise IOError(f"write_registers failed at {address}: {rr}")
 
     # --- heartbeat ---
     def start_heartbeat(self, period_s: float = 0.2) -> None:
         """Start a background thread that increments the master heartbeat."""
         if self._hb_thread and self._hb_thread.is_alive():
             return
+
+        # Write once synchronously so the PLC can immediately see the heartbeat change.
+        try:
+            self._hb_counter = (self._hb_counter + 1) & 0xFFFF
+            self.write_reg(self.sv_base + O_SYS_MASTER_HB, self._hb_counter)
+        except Exception:
+            # Heartbeat thread will continue attempting writes.
+            pass
 
         self._hb_stop.clear()
 
@@ -466,6 +533,19 @@ class EnvistaClient:
             curr = int(self.read_holding(self.sv_base + seq_offset, 1)[0]) & 0xFFFF
         return (curr + 1) & 0xFFFF
 
+    def _wait_ack(self, ack_offset: int, expect_seq: int, *, timeout_s: float = 2.0, poll_s: float = 0.05) -> EnvistaStatus:
+        """Wait until the PLC ack counter matches the expected seq."""
+        exp = int(expect_seq) & 0xFFFF
+        deadline = time.time() + float(timeout_s)
+        last = self.read_status()
+        while time.time() < deadline:
+            got = int(last.regs[ack_offset]) & 0xFFFF
+            if got == exp:
+                return last
+            time.sleep(float(poll_s))
+            last = self.read_status()
+        raise TimeoutError(f"Ack timeout (off={ack_offset}, expect={exp}, got={int(last.regs[ack_offset]) & 0xFFFF})")
+
     # --- system commands ---
     def _send_sys_cmd(self, action_bits: int = 0, *, allow_motion: Optional[bool] = None, debug_enable: Optional[bool] = None) -> None:
         st = self.read_status()  # keeps cache fresh
@@ -488,6 +568,11 @@ class EnvistaClient:
         seq = self._next_seq(O_SYS_CMD_SEQ)
         self.write_reg(self.sv_base + O_SYS_CMD_WORD, cmd)
         self.write_reg(self.sv_base + O_SYS_CMD_SEQ, seq)
+        try:
+            self._wait_ack(O_SYS_ACK_SEQ, seq, timeout_s=1.0)
+        except Exception:
+            # Status polling can surface faults; avoid hard-failing UI toggles.
+            pass
 
     def set_allow_motion(self, enabled: bool) -> None:
         self._send_sys_cmd(0, allow_motion=bool(enabled))
@@ -506,16 +591,43 @@ class EnvistaClient:
 
     # --- actuator commands ---
     def actuator_calibrate(self, *, wait: bool = False, timeout_s: float = 180.0, poll_s: float = 0.2) -> None:
+        pre = self.read_status()
+        pre_cal_valid = bool(pre.act_calib_valid)
+
         seq = self._next_seq(O_ACT_CMD_SEQ)
         self.write_reg(self.sv_base + O_ACT_CMD_WORD, ACT_CMD_CALIBRATE)
         self.write_reg(self.sv_base + O_ACT_CMD_SEQ, seq)
+        self._wait_ack(O_ACT_ACK_SEQ, seq, timeout_s=2.0)
         if wait:
-            self.wait_until(lambda s: s.act_calib_valid and not s.act_in_motion, timeout_s=timeout_s, poll_s=poll_s)
+            deadline = time.time() + float(timeout_s)
+            start_deadline = min(deadline, time.time() + 2.0)
+            saw_motion = False
+            last = self.read_status()
+            while time.time() < deadline:
+                last = self.read_status()
+                if last.act_in_motion:
+                    saw_motion = True
+
+                if saw_motion:
+                    if last.act_calib_valid and not last.act_in_motion:
+                        return
+                else:
+                    # If already calibrated and nothing starts, treat as no-op.
+                    if pre_cal_valid and last.act_calib_valid and not last.act_in_motion and time.time() >= start_deadline:
+                        return
+                    # If not calibrated, calibration must start promptly.
+                    if (not pre_cal_valid) and time.time() >= start_deadline and (not last.act_in_motion):
+                        raise TimeoutError("Calibration did not start (axis never entered motion).")
+
+                time.sleep(float(poll_s))
+
+            raise TimeoutError("Calibration did not complete before timeout.")
 
     def actuator_halt(self) -> None:
         seq = self._next_seq(O_ACT_CMD_SEQ)
         self.write_reg(self.sv_base + O_ACT_CMD_WORD, ACT_CMD_HALT)
         self.write_reg(self.sv_base + O_ACT_CMD_SEQ, seq)
+        self._wait_ack(O_ACT_ACK_SEQ, seq, timeout_s=2.0)
 
     def actuator_goto(self, target_steps: int, *, wait: bool = False, timeout_s: float = 60.0, poll_s: float = 0.2) -> None:
         # Clamp to known range if calibrated
@@ -524,60 +636,123 @@ class EnvistaClient:
         if st.act_calib_total_steps > 0:
             t = max(0, min(t, st.act_calib_total_steps))
 
+        start_pos = int(st.act_pos_steps)
+
         self.write_regs(self.sv_base + O_ACT_TARGET_DINT, pack_dint_le(t))
         seq = self._next_seq(O_ACT_CMD_SEQ)
         self.write_reg(self.sv_base + O_ACT_CMD_WORD, ACT_CMD_GOTO_ABS)
         self.write_reg(self.sv_base + O_ACT_CMD_SEQ, seq)
+        self._wait_ack(O_ACT_ACK_SEQ, seq, timeout_s=2.0)
 
         if wait:
-            self.wait_until(lambda s: not s.act_in_motion, timeout_s=timeout_s, poll_s=poll_s)
+            deadline = time.time() + float(timeout_s)
+            start_deadline = min(deadline, time.time() + 1.5)
+            saw_motion = False
+            tol_steps = 2
+
+            last = self.read_status()
+            while time.time() < deadline:
+                last = self.read_status()
+                pos = int(last.act_pos_steps)
+                moving = bool(last.act_in_motion)
+
+                if moving or abs(pos - start_pos) >= tol_steps:
+                    saw_motion = True
+
+                # Done condition: stopped and at target (or very near).
+                if (not moving) and abs(pos - t) <= tol_steps:
+                    return
+
+                # If we never observe motion and we aren't at target shortly after command, assume rejected.
+                if (not saw_motion) and (time.time() >= start_deadline) and (not moving) and abs(pos - t) > tol_steps:
+                    raise TimeoutError("Actuator did not start moving (no motion observed).")
+
+                time.sleep(float(poll_s))
+
+            raise TimeoutError("Actuator move did not complete before timeout.")
 
     def actuator_jog_pos(self) -> None:
         seq = self._next_seq(O_ACT_CMD_SEQ)
         self.write_reg(self.sv_base + O_ACT_CMD_WORD, ACT_CMD_JOG_POS)
         self.write_reg(self.sv_base + O_ACT_CMD_SEQ, seq)
+        self._wait_ack(O_ACT_ACK_SEQ, seq, timeout_s=2.0)
 
     def actuator_jog_neg(self) -> None:
         seq = self._next_seq(O_ACT_CMD_SEQ)
         self.write_reg(self.sv_base + O_ACT_CMD_WORD, ACT_CMD_JOG_NEG)
         self.write_reg(self.sv_base + O_ACT_CMD_SEQ, seq)
+        self._wait_ack(O_ACT_ACK_SEQ, seq, timeout_s=2.0)
 
     # --- turntable commands ---
     def turntable_halt(self) -> None:
         seq = self._next_seq(O_TT_CMD_SEQ)
         self.write_reg(self.sv_base + O_TT_CMD_WORD, TT_CMD_HALT)
         self.write_reg(self.sv_base + O_TT_CMD_SEQ, seq)
+        self._wait_ack(O_TT_ACK_SEQ, seq, timeout_s=2.0)
 
     def turntable_move_rel(self, delta_deg: float, *, wait: bool = False, timeout_s: float = 60.0, poll_s: float = 0.2) -> None:
+        start = self.read_status()
+        start_pos = float(start.tt_pos_deg)
+        expected = normalize_angle_deg(start_pos + float(delta_deg))
+
         deg_x1000 = int(round(float(delta_deg) * 1000.0))
         self.write_regs(self.sv_base + O_TT_TARGET_DINT, pack_dint_le(deg_x1000))
         seq = self._next_seq(O_TT_CMD_SEQ)
         self.write_reg(self.sv_base + O_TT_CMD_WORD, TT_CMD_MOVE_REL)
         self.write_reg(self.sv_base + O_TT_CMD_SEQ, seq)
+        self._wait_ack(O_TT_ACK_SEQ, seq, timeout_s=2.0)
         if wait:
-            self.wait_until(lambda s: not s.tt_in_motion, timeout_s=timeout_s, poll_s=poll_s)
+            deadline = time.time() + float(timeout_s)
+            start_deadline = min(deadline, time.time() + 1.5)
+            saw_motion = False
+            tol_deg = 0.25
+
+            last = self.read_status()
+            while time.time() < deadline:
+                last = self.read_status()
+                pos = float(last.tt_pos_deg)
+                moving = bool(last.tt_in_motion)
+
+                # Detect motion either via flag or via position change.
+                if moving or abs(normalize_angle_deg(pos - start_pos)) >= tol_deg:
+                    saw_motion = True
+
+                # Done condition: not moving and close to expected.
+                if (not moving) and abs(normalize_angle_deg(pos - expected)) <= tol_deg:
+                    return
+
+                if (not saw_motion) and (time.time() >= start_deadline) and (not moving) and abs(normalize_angle_deg(pos - expected)) > tol_deg:
+                    raise TimeoutError("Turntable did not start moving (no motion observed).")
+
+                time.sleep(float(poll_s))
+
+            raise TimeoutError("Turntable move did not complete before timeout.")
 
     def turntable_jog_cw(self) -> None:
         seq = self._next_seq(O_TT_CMD_SEQ)
         self.write_reg(self.sv_base + O_TT_CMD_WORD, TT_CMD_JOG_CW)
         self.write_reg(self.sv_base + O_TT_CMD_SEQ, seq)
+        self._wait_ack(O_TT_ACK_SEQ, seq, timeout_s=2.0)
 
     def turntable_jog_ccw(self) -> None:
         seq = self._next_seq(O_TT_CMD_SEQ)
         self.write_reg(self.sv_base + O_TT_CMD_WORD, TT_CMD_JOG_CCW)
         self.write_reg(self.sv_base + O_TT_CMD_SEQ, seq)
+        self._wait_ack(O_TT_ACK_SEQ, seq, timeout_s=2.0)
 
     def turntable_reset_home(self) -> None:
         """Enter home-reset mode (turntable ENA disabled so user can rotate by hand)."""
         seq = self._next_seq(O_TT_CMD_SEQ)
         self.write_reg(self.sv_base + O_TT_CMD_WORD, TT_CMD_RESET_HOME)
         self.write_reg(self.sv_base + O_TT_CMD_SEQ, seq)
+        self._wait_ack(O_TT_ACK_SEQ, seq, timeout_s=2.0)
 
     def turntable_set_home(self) -> None:
         """Set the current physical position as home (0°) and exit home-reset mode."""
         seq = self._next_seq(O_TT_CMD_SEQ)
         self.write_reg(self.sv_base + O_TT_CMD_WORD, TT_CMD_SET_HOME)
         self.write_reg(self.sv_base + O_TT_CMD_SEQ, seq)
+        self._wait_ack(O_TT_ACK_SEQ, seq, timeout_s=2.0)
 
     # --- waiting utilities ---
     def wait_until(self, predicate, *, timeout_s: float = 10.0, poll_s: float = 0.2) -> EnvistaStatus:

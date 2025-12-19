@@ -143,8 +143,8 @@ A PyQt5-based industrial inspection application that combines Detectron2 deep le
 |-----------|---------------|---------|
 | **Computer** | Windows 10/11, 16GB+ RAM | Host system |
 | **GPU** | NVIDIA GPU with CUDA 12.6 support | AI inference acceleration |
-| **Top Camera** | Industrial camera (iRAYPLE/Basler) | Top-view part imaging |
-| **Front Camera** | Industrial camera (iRAYPLE/Basler) | Front-view inspection |
+| **Top Camera** | GigE Vision camera + GenTL producer (.cti) | Top-view part imaging |
+| **Front Camera** | GigE Vision camera + GenTL producer (.cti) | Front-view inspection |
 
 ### Optional Components
 | Component | Specification | Purpose |
@@ -155,17 +155,13 @@ A PyQt5-based industrial inspection application that combines Detectron2 deep le
 
 ### Camera Hardware
 
-#### Option 1: iRAYPLE/MindVision Cameras (Recommended)
-- **Installation**: Download and install [MV Viewer](https://en.mindvision.com.cn/ziliaoxiazai/ruanjianxiazai/) from MindVision
-- **Required files**:
-  - SDK headers: `C:\Program Files\HuarayTech\MV Viewer\Development\Samples\Python\IMV\MVSDK\IMVApi.py` + `IMVDefines.py`
-  - Runtime DLL: `C:\Program Files\HuarayTech\MV Viewer\Runtime\x64\MVSDKmd.dll`
-- **Custom paths**: Edit `services/camera_backend_irayple.py` if installed elsewhere
+#### GigE Vision Cameras (Harvester / GenTL)
+- **GenTL producer (.cti)**: The app looks for `MV GigE V/MVProducerGEV.cti` by default (HuarayTech/MindVision).
+- **Override**: Set `ENVISTA_GENTL_FILE` to your vendor's `.cti` file path.
+- **Note**: Some producers require installing the vendor runtime so dependent DLLs are present.
 
-#### Option 2: Basler Cameras
-- **Installation**: Download [pypylon SDK](https://github.com/basler/pypylon)
-- **Python package**: `pip install pypylon`
-- **Compatibility**: Tested with Basler ace/dart series
+#### Basler Cameras (via GenTL)
+- Install Basler pylon runtime and point `ENVISTA_GENTL_FILE` at Basler's GigE Vision `.cti` (no `pypylon` required).
 
 ### Turntable/Linear Axis
 - **Communication**: Serial (USB-to-Serial adapter recommended)
@@ -1025,14 +1021,13 @@ Envista-Solomon/
 ├── requirements.txt             # Python dependencies
 ├── user_settings.json          # Persistent configuration (auto-generated)
 ├── crash.log                   # Error log (auto-generated)
+├── MV GigE V/                   # GenTL producer bundle (MVProducerGEV.cti)
 │
 ├── services/                   # Backend services
 │   ├── __init__.py
 │   ├── app_paths.py           # Path utilities
-│   ├── camera_backend_irayple.py  # iRAYPLE camera driver
-│   ├── camera_backend_pylon.py    # Basler Pylon driver
 │   ├── camera_manager.py      # Unified camera + light interface
-│   ├── camera_service.py      # Camera enumeration & capture
+│   ├── camera_service.py      # Camera enumeration & capture (Harvester/GenTL)
 │   ├── config.py              # Settings dataclasses
 │   ├── contour_tools.py       # Edge detection & arrow computation
 │   ├── crash_reporter.py      # Exception logging

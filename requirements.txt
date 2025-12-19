@@ -5,6 +5,10 @@ PyQt5>=5.15.0
 opencv-python>=4.5.0
 numpy>=1.20.0
 
+# GenTL / GigE Vision Cameras (Harvester)
+harvesters>=1.4.0
+genicam>=1.0.0
+
 # Deep Learning Framework (CUDA 12.6 compatible)
 # Install from: https://download.pytorch.org/whl/cu126
 torch==2.7.1
@@ -17,10 +21,10 @@ torchaudio==2.7.1
 
 # Hardware Communication
 pyserial>=3.5
+pymodbus>=3.0.0
 
-# Optional Camera Backends
-# pypylon  # For Basler cameras - install separately if needed
-# Note: iRAYPLE/MindVision SDK must be installed separately from vendor
+# Camera Notes
+# - Provide a vendor GenTL Producer (.cti) and set ENVISTA_GENTL_FILE when needed.
 
 # Development/Testing (optional)
 # pytest

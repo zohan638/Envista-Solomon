@@ -14,7 +14,6 @@ from PyQt5.QtWidgets import (
 class TurntablePanel(QWidget):
     refresh_requested = pyqtSignal()
     connect_requested = pyqtSignal(str)
-    disconnect_requested = pyqtSignal()
     home_requested = pyqtSignal()
     rotate_requested = pyqtSignal(float)
     port_selected = pyqtSignal(str)
@@ -30,6 +29,7 @@ class TurntablePanel(QWidget):
 
         row = QHBoxLayout()
         self.port_combo = QComboBox()
+        self.port_combo.setEditable(True)
         self.port_combo.currentTextChanged.connect(lambda s: self.port_selected.emit(s))
         row.addWidget(self.port_combo, stretch=1)
 
@@ -39,7 +39,7 @@ class TurntablePanel(QWidget):
 
         self.bt_connect = QPushButton("Connect")
         self._apply_connect_style(False)
-        self.bt_connect.clicked.connect(self._on_toggle_connect)
+        self.bt_connect.clicked.connect(self._on_connect)
         row.addWidget(self.bt_connect)
 
         self.bt_home = QPushButton("Home")
@@ -71,13 +71,10 @@ class TurntablePanel(QWidget):
 
         self._connected = False
 
-    def _on_toggle_connect(self):
-        if self._connected:
-            self.disconnect_requested.emit()
-        else:
-            port = self.port_combo.currentText().strip()
-            if port:
-                self.connect_requested.emit(port)
+    def _on_connect(self):
+        port = self.port_combo.currentText().strip()
+        if port:
+            self.connect_requested.emit(port)
 
     def set_ports(self, ports):
         self.port_combo.blockSignals(True)
@@ -90,7 +87,7 @@ class TurntablePanel(QWidget):
         self._connected = connected
         self.port_combo.setEnabled(not connected)
         self.bt_refresh.setEnabled(not connected)
-        self.bt_connect.setText("Disconnect" if connected else "Connect")
+        self.bt_connect.setText("Reconnect" if connected else "Connect")
         self._apply_connect_style(connected)
         self.bt_home.setEnabled(connected)
         self.bt_ccw.setEnabled(connected)

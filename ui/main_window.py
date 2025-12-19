@@ -1,4 +1,4 @@
-from PyQt5.QtCore import Qt, pyqtSignal, QObject
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer
 from PyQt5.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -19,11 +19,13 @@ from services import camera_service
 from services import camera_manager as cammgr
 from services import turntable_service
 from services import linear_axis_service
+from services import plc_service
 from services.config import settings, state, save_state
 from services import solvision_manager
 from services.app_paths import app_root
 import concurrent.futures
 import os
+import time
 import cv2
 
 # Horizontal FOV of the front camera when measured inside the top-camera image (pixels)
@@ -33,12 +35,15 @@ DEFAULT_FRONT_FOV_TOP_PX = 951.0
 class _AxisUiBridge(QObject):
     set_ready = pyqtSignal(bool)
     set_calibrating = pyqtSignal(bool)
-    set_calibrated = pyqtSignal(bool, object)  # object for Optional[float]
+    set_calibrated = pyqtSignal(bool, object, object)  # (position_steps, total_steps)
     set_position = pyqtSignal(object)
 
 class MainWindow(QMainWindow):
     tt_message = pyqtSignal(str)
     tt_status = pyqtSignal(str)
+    plc_snapshot = pyqtSignal(object)
+    live_frame_ready = pyqtSignal(str, int, object)  # (role, gen, frame)
+    live_error_ready = pyqtSignal(str, int, str, str)  # (role, gen, err_short, err_full)
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Detectron Demo")
@@ -110,8 +115,20 @@ class MainWindow(QMainWindow):
         cam.refresh_requested.connect(self.on_camera_refresh)
         cam.connect_requested.connect(self.on_camera_connect)
         cam.disconnect_requested.connect(self.on_camera_disconnect)
-        cam.capture_requested.connect(self.on_camera_capture)
         cam.selection_changed.connect(self.on_camera_selected)
+
+        # Live camera feed (no manual capture button)
+        self._live_enabled = False
+        self._live_closed = False
+        self._live_gen = {"Top": 0, "Front": 0}
+        self._live_inflight = {"Top": None, "Front": None}
+        self._live_err_ts = {"Top": 0.0, "Front": 0.0}
+        self._live_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        self._live_timer = QTimer(self)
+        self._live_timer.setInterval(50)
+        self._live_timer.timeout.connect(self._on_live_tick)
+        self.live_frame_ready.connect(self._on_live_frame_ready)
+        self.live_error_ready.connect(self._on_live_error_ready)
 
         # Initial device list
         self.on_camera_refresh()
@@ -122,7 +139,6 @@ class MainWindow(QMainWindow):
         tt = self.workflow_tab.turntable_panel
         tt.refresh_requested.connect(self.on_turntable_refresh)
         tt.connect_requested.connect(self.on_turntable_connect)
-        tt.disconnect_requested.connect(self.on_turntable_disconnect)
         tt.home_requested.connect(self.on_turntable_home)
         tt.rotate_requested.connect(self.on_turntable_rotate)
         tt.port_selected.connect(self.on_turntable_port_selected)
@@ -130,15 +146,22 @@ class MainWindow(QMainWindow):
         # Subscribe to turntable messages for logging (thread-safe via signal relay)
         self.tt_message.connect(self._handle_turntable_message)
         self.tt_status.connect(self._handle_turntable_status)
+        self.plc_snapshot.connect(self._handle_plc_snapshot)
         self._tt_listener = self._on_tt_raw_message
         turntable_service.add_listener(self._tt_listener)
+        try:
+            plc_service.add_status_listener(self._on_plc_snapshot_raw)
+        except Exception:
+            pass
+        self._plc_connected_last = None
+        self._plc_axis_cal_last = None
+        self._plc_health_last = None
         self.on_turntable_refresh()
 
         # Linear axis panel signals
         ax = self.workflow_tab.linear_axis_panel
         ax.refresh_requested.connect(self.on_axis_refresh)
         ax.connect_requested.connect(self.on_axis_connect)
-        ax.disconnect_requested.connect(self.on_axis_disconnect)
         ax.calibrate_requested.connect(self.on_axis_calibrate)
         ax.home_requested.connect(self.on_axis_home)
         ax.goto_requested.connect(self.on_axis_goto)
@@ -147,7 +170,7 @@ class MainWindow(QMainWindow):
         self._axis_ui = _AxisUiBridge()
         self._axis_ui.set_ready.connect(ax.set_ready)
         self._axis_ui.set_calibrating.connect(ax.set_calibrating)
-        self._axis_ui.set_calibrated.connect(lambda ok, p=None: ax.set_calibrated(ok, p if p is not None else None))
+        self._axis_ui.set_calibrated.connect(lambda ok, p=None, t=None: ax.set_calibrated(ok, p if p is not None else None, total_steps=t))
         self._axis_ui.set_position.connect(lambda p: ax.set_position(p))
         # Initial axis ports
         self.on_axis_refresh()
@@ -160,6 +183,8 @@ class MainWindow(QMainWindow):
             front_idx = camera_service.get_connected_index("Front")
             if front_idx is not None:
                 self.workflow_tab.camera_panel.set_connected("Front", True, "")
+            if top_idx is not None or front_idx is not None:
+                self._start_live_feed()
             # Restore saved selections
             st = state()
             if top_idx is None and st.camera_top_index is not None:
@@ -174,8 +199,8 @@ class MainWindow(QMainWindow):
                 self.workflow_tab.turntable_panel.set_connected(True, turntable_service.port_name())
             else:
                 st = state()
-                if st.turntable_port:
-                    idx = self.workflow_tab.turntable_panel.port_combo.findText(st.turntable_port)
+                if getattr(st, "plc_host", None):
+                    idx = self.workflow_tab.turntable_panel.port_combo.findText(str(st.plc_host))
                     if idx >= 0:
                         self.workflow_tab.turntable_panel.port_combo.setCurrentIndex(idx)
                 if st.turntable_step is not None:
@@ -202,6 +227,60 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _on_live_frame_ready(self, role: str, gen: int, frame):
+        if self._live_closed or not self._live_enabled:
+            return
+        role_norm = "Top" if role == "Top" else "Front"
+        try:
+            if int(self._live_gen.get(role_norm, 0) or 0) != int(gen):
+                return
+        except Exception:
+            return
+        if frame is None:
+            return
+        try:
+            pm = np_bgr_to_qpixmap(frame)
+            if pm is None or pm.isNull():
+                return
+            if role_norm == "Top":
+                self.preview_panel.set_original_np(pm)
+            else:
+                self.preview_panel.set_front_np(pm)
+            try:
+                self.workflow_tab.camera_panel.set_stream_status(role_norm, "Live feed: OK")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _on_live_error_ready(self, role: str, gen: int, err_short: str, err_full: str):
+        if self._live_closed or not self._live_enabled:
+            return
+        role_norm = "Top" if role == "Top" else "Front"
+        try:
+            if int(self._live_gen.get(role_norm, 0) or 0) != int(gen):
+                return
+        except Exception:
+            return
+
+        now = time.time()
+        try:
+            last = float(self._live_err_ts.get(role_norm, 0.0) or 0.0)
+            if now - last < 2.0:
+                return
+            self._live_err_ts[role_norm] = now
+        except Exception:
+            pass
+
+        try:
+            self.workflow_tab.append_log(f"[Camera] Live {role_norm} failed: {err_full}")
+        except Exception:
+            pass
+        try:
+            self.workflow_tab.camera_panel.set_stream_status(role_norm, f"Live feed: error ({err_short})")
+        except Exception:
+            pass
+
     # Slots
     def on_load_project(self):
         # Legacy handler unused (single model box removed). Use Selected Files instead.
@@ -212,6 +291,10 @@ class MainWindow(QMainWindow):
         pass
 
     def on_load_image(self):
+        try:
+            self._stop_live_feed()
+        except Exception:
+            pass
         path, _ = QFileDialog.getOpenFileName(self, "Choose Image", "", "Images (*.png *.jpg *.jpeg *.bmp);;All Files (*.*)")
         if not path:
             return
@@ -225,6 +308,10 @@ class MainWindow(QMainWindow):
         self.preview_panel.set_front_preview_image(path)
 
     def on_run_detection(self):
+        try:
+            self._stop_live_feed()
+        except Exception:
+            pass
         # Prepare capture directory structure based on date/time
         from datetime import datetime
         import re
@@ -283,6 +370,7 @@ class MainWindow(QMainWindow):
         # Prefer top camera capture; fallback to currently loaded image
         img_path = None
         from services import camera_service
+        capture_error = None
         try:
             if camera_service.is_connected("Top"):
                 # Capture and write to captures folder for Detectron
@@ -321,10 +409,24 @@ class MainWindow(QMainWindow):
                     except Exception:
                         pass
         except Exception as ex:
-            self.workflow_tab.append_log(f"[Camera] Capture failed: {ex}")
+            capture_error = str(ex)
+            self.workflow_tab.append_log(f"[Camera] Capture failed: {capture_error}")
             img_path = self._current_image_path
         if not img_path:
-            QMessageBox.information(self, "Run Detection", "Please connect top camera or load an image first.")
+            if capture_error:
+                QMessageBox.information(
+                    self,
+                    "Run Detection",
+                    "Top camera capture failed:\n"
+                    f"{capture_error}\n\n"
+                    "Please reconnect the top camera or load an image first.",
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "Run Detection",
+                    "Please connect top camera or load an image first.",
+                )
             return
         self.workflow_tab.append_log("[Detectron] Running detection...")
         try:
@@ -764,16 +866,17 @@ class MainWindow(QMainWindow):
     def on_turntable_connect(self, port: str):
         ok = turntable_service.connect(port)
         if ok:
-            self.workflow_tab.turntable_panel.set_connected(True, port)
-            self.workflow_tab.append_log(f"[Turntable] Connected to {port}.")
-            st = state(); st.turntable_port = port; st.turntable_step = float(self.workflow_tab.turntable_panel.step.value()); save_state()
+            self.workflow_tab.turntable_panel.set_connected(True, turntable_service.port_name() or port)
+            # PLC drives both turntable and linear axis; reflect connection on axis panel too.
+            try:
+                self.workflow_tab.linear_axis_panel.set_connected(True, linear_axis_service.port_name() or port)
+                self.workflow_tab.linear_axis_panel.set_ready(True)
+            except Exception:
+                pass
+            self.workflow_tab.append_log(f"[PLC] Connected to {turntable_service.port_name() or port}.")
+            st = state(); st.plc_host = str(port).split(":", 1)[0].strip() or str(port).strip(); st.turntable_step = float(self.workflow_tab.turntable_panel.step.value()); save_state()
         else:
-            self.workflow_tab.append_log(f"[Turntable] Connection failed for {port}.")
-
-    def on_turntable_disconnect(self):
-        turntable_service.disconnect()
-        self.workflow_tab.turntable_panel.set_connected(False)
-        self.workflow_tab.append_log("[Turntable] Disconnected.")
+            self.workflow_tab.append_log(f"[PLC] Connection failed for {port}: {plc_service.last_error() or ''}".strip())
 
     def on_turntable_home(self):
         # Run homing in a background thread to avoid blocking UI
@@ -916,15 +1019,19 @@ class MainWindow(QMainWindow):
                     self.tt_message.emit(f"[Step2] Skipping index {idx}: missing phi.")
                     continue
 
-                # Compute turntable delta (deg) and desired axis target (mm) for this detection.
+                # Compute turntable delta (deg) and desired actuator target (steps) for this detection.
                 move_deg = math.degrees(phi - last_phi)
                 last_phi = phi
 
-                target_mm = None
+                target_steps = None
                 axis_reason = None
                 try:
                     if linear_axis_service.is_calibrated():
                         from services.config import state as _state
+                        total_steps = linear_axis_service.calibration_total_steps()
+                        if total_steps is None:
+                            axis_reason = "invalid calibration (total steps unavailable)"
+                            raise RuntimeError(axis_reason)
                         try:
                             off_top = float(d.get('offset_top_rot_px', d.get('offset_top_px', 0.0)) or 0.0)
                         except Exception:
@@ -940,8 +1047,17 @@ class MainWindow(QMainWindow):
                             FRONT_WIDTH_PX = 2592.0
                             delta_px = (off_top / top_fov_val) * FRONT_WIDTH_PX
                             delta_mm = delta_px / PIXELS_PER_MM
-                            tgt = 50.0 + delta_mm
-                            target_mm = max(0.0, min(100.0, tgt))
+                            # Convert mm offset into actuator steps using the calibrated total step range.
+                            try:
+                                cfg = _state()
+                                home_steps = getattr(cfg, "linear_axis_home_steps", None)
+                                if home_steps is None:
+                                    home_steps = int(total_steps) // 2
+                            except Exception:
+                                home_steps = int(total_steps) // 2
+                            delta_steps = int(round((float(delta_mm) / 100.0) * float(total_steps)))
+                            tgt_steps = int(home_steps) + int(delta_steps)
+                            target_steps = max(0, min(int(total_steps), int(tgt_steps)))
                         else:
                             axis_reason = "invalid front FOV"
                     else:
@@ -950,23 +1066,24 @@ class MainWindow(QMainWindow):
                     axis_reason = f"axis alignment failed: {ex}"
 
                 # Helpers for robust moves
-                def _axis_move_safe(target: float) -> dict:
+                def _axis_move_safe(target: int) -> dict:
                     res = {"msg": None, "err": None}
                     try:
-                        curr = linear_axis_service.current_position_mm()
+                        curr = linear_axis_service.current_position_steps()
                     except Exception:
                         curr = None
-                    if curr is not None and abs(curr - target) < 0.05:
+                    if curr is not None and abs(int(curr) - int(target)) <= 2:
                         res["msg"] = "[INFO] Already at requested position."
                         return res
                     try:
-                        move_res = linear_axis_service.goto_mm(target)
+                        move_res = linear_axis_service.goto_steps(int(target))
                         if move_res.success:
                             res["msg"] = move_res.message
                         else:
                             # Retry once if timed out
-                            if "timed out" in move_res.message.lower():
-                                retry = linear_axis_service.goto_mm(target)
+                            low = (move_res.message or "").lower()
+                            if ("timed out" in low) or ("timeout" in low):
+                                retry = linear_axis_service.goto_steps(int(target))
                                 if retry.success:
                                     res["msg"] = retry.message + " (retried)"
                                 else:
@@ -1004,14 +1121,14 @@ class MainWindow(QMainWindow):
                     tt_res.update(r)
 
                 def _move_axis():
-                    if target_mm is None:
+                    if target_steps is None:
                         return
-                    r = _axis_move_safe(target_mm)
+                    r = _axis_move_safe(int(target_steps))
                     ax_res.update(r)
 
                 threads = []
                 t1 = threading.Thread(target=_move_tt, daemon=True); threads.append(t1); t1.start()
-                if target_mm is not None:
+                if target_steps is not None:
                     t2 = threading.Thread(target=_move_axis, daemon=True); threads.append(t2); t2.start()
 
                 for t in threads:
@@ -1024,7 +1141,7 @@ class MainWindow(QMainWindow):
                 if tt_res["msg"]:
                     self.tt_message.emit(f"[Step2] Rotate idx {idx}: {tt_res['msg']}")
 
-                if target_mm is None:
+                if target_steps is None:
                     if axis_reason:
                         self.tt_message.emit(f"[Step2] Axis alignment skipped: {axis_reason}")
                 else:
@@ -1115,28 +1232,50 @@ class MainWindow(QMainWindow):
                             self.tt_message.emit(f"[Step2] Detection missing center; discarding idx {idx}.")
                             continue
                         dx_px = dcx - cx_crop  # + => bbox to the right of center
-                        # Convert pixel offset to mm using front camera scale
+                        # Convert pixel offset to actuator steps using front camera scale and calibration total steps.
                         PIXELS_PER_MM = 66.3035714
-                        dx_mm = dx_px / PIXELS_PER_MM
+                        dx_mm = float(dx_px) / float(PIXELS_PER_MM)
                         try:
-                            curr_pos = linear_axis_service.current_position_mm()
-                            if curr_pos is None:
-                                curr_pos = 50.0
+                            total_steps = linear_axis_service.calibration_total_steps()
                         except Exception:
-                            curr_pos = 50.0
-                        # Flip sign: bbox right of center -> move axis left (negative delta)
-                        new_target = max(0.0, min(100.0, curr_pos - dx_mm))
-                        if abs(dx_mm) > 0.05:
-                            try:
-                                corr_res = _axis_move_safe(new_target)
-                                if corr_res["err"]:
-                                    self.tt_message.emit(f"[Step2] Correction move failed: {corr_res['err']}")
-                                elif corr_res["msg"]:
-                                    self.tt_message.emit(f"{corr_res['msg']} (correction dx={dx_px:.2f}px -> {dx_mm:.2f}mm, new={new_target:.2f}mm)")
-                            except Exception as ex:
-                                self.tt_message.emit(f"[Step2] Correction move failed: {ex}")
+                            total_steps = None
+
+                        if not total_steps or total_steps <= 0:
+                            self.tt_message.emit("[Step2] Correction skipped: actuator calibration invalid (total steps unavailable).")
                         else:
-                            self.tt_message.emit(f"[Step2] Alignment within tolerance (dx={dx_px:.2f}px); no correction move.")
+                            try:
+                                curr_steps = linear_axis_service.current_position_steps()
+                            except Exception:
+                                curr_steps = None
+                            if curr_steps is None:
+                                try:
+                                    cfg = _state()
+                                    curr_steps = getattr(cfg, "linear_axis_home_steps", None)
+                                except Exception:
+                                    curr_steps = None
+                            if curr_steps is None:
+                                curr_steps = int(total_steps) // 2
+
+                            dx_steps = int(round((dx_mm / 100.0) * float(total_steps)))
+                            # Flip sign: bbox right of center -> move actuator left (negative delta)
+                            new_target = max(0, min(int(total_steps), int(curr_steps) - int(dx_steps)))
+                            tol_steps = max(1, int(round((0.05 / 100.0) * float(total_steps))))
+
+                            if abs(dx_steps) > tol_steps:
+                                try:
+                                    corr_res = _axis_move_safe(new_target)
+                                    if corr_res["err"]:
+                                        self.tt_message.emit(f"[Step2] Correction move failed: {corr_res['err']}")
+                                    elif corr_res["msg"]:
+                                        self.tt_message.emit(
+                                            f"{corr_res['msg']} (correction dx={dx_px:.2f}px -> {dx_mm:.3f}mm -> {dx_steps} steps, new={new_target} steps)"
+                                        )
+                                except Exception as ex:
+                                    self.tt_message.emit(f"[Step2] Correction move failed: {ex}")
+                            else:
+                                self.tt_message.emit(
+                                    f"[Step2] Alignment within tolerance (dx={dx_px:.2f}px -> {dx_mm:.3f}mm -> {dx_steps} steps); no correction move."
+                                )
 
                         # Capture corrected frame
                         overlay = _capture_front()
@@ -1312,11 +1451,16 @@ class MainWindow(QMainWindow):
                 if linear_axis_service.is_connected() and linear_axis_service.is_calibrated():
                     try:
                         from services.config import state as _state
-                        hm = getattr(_state(), "linear_axis_home_mm", None)
-                        home_mm = float(hm) if hm is not None else 50.0
+                        cfg = _state()
+                        hs = getattr(cfg, "linear_axis_home_steps", None)
+                        if hs is None:
+                            total = linear_axis_service.calibration_total_steps()
+                            hs = (int(total) // 2) if total else 0
+                        home_steps = int(hs)
                     except Exception:
-                        home_mm = 50.0
-                    res_ax_home = linear_axis_service.home(home_mm=home_mm)
+                        total = linear_axis_service.calibration_total_steps()
+                        home_steps = (int(total) // 2) if total else 0
+                    res_ax_home = linear_axis_service.home(home_steps=home_steps)
                     self.tt_message.emit(res_ax_home.message)
                 else:
                     self.tt_message.emit("[Step2] Axis home skipped (not connected/calibrated).")
@@ -1366,7 +1510,16 @@ class MainWindow(QMainWindow):
         return (norm * 255.0).clip(0, 255).astype(_np.uint8)
 
     def on_turntable_port_selected(self, port: str):
-        st = state(); st.turntable_port = port; st.turntable_step = float(self.workflow_tab.turntable_panel.step.value()); save_state()
+        try:
+            host = str(port or "").strip()
+            if ":" in host and host.count(":") == 1:
+                host = host.split(":", 1)[0].strip()
+            st = state()
+            st.plc_host = host or None
+            st.turntable_step = float(self.workflow_tab.turntable_panel.step.value())
+            save_state()
+        except Exception:
+            pass
 
     def on_turntable_step_changed(self, v: float):
         st = state(); st.turntable_step = float(v); save_state()
@@ -1405,8 +1558,155 @@ class MainWindow(QMainWindow):
         if msg:
             self.tt_message.emit(msg)
 
+    def _on_plc_snapshot_raw(self, snap):
+        # Called from PLC poll thread; relay to UI thread via signal
+        try:
+            self.plc_snapshot.emit(snap)
+        except Exception:
+            pass
+
+    def _handle_plc_snapshot(self, snap):
+        """
+        Keep UI connection state in sync with the shared PLC service.
+        Note: Avoid spamming panel status labels on every poll; only update
+        when connection/calibration state changes.
+        """
+        try:
+            connected = bool(getattr(snap, "connected", False))
+            endpoint = plc_service.endpoint() or ""
+
+            if self._plc_connected_last is None or connected != self._plc_connected_last:
+                try:
+                    self.workflow_tab.turntable_panel.set_connected(connected, endpoint)
+                except Exception:
+                    pass
+                try:
+                    self.workflow_tab.linear_axis_panel.set_connected(connected, endpoint)
+                    self.workflow_tab.linear_axis_panel.set_ready(connected)
+                except Exception:
+                    pass
+                if not connected:
+                    err = getattr(snap, "last_error", None) or "PLC disconnected."
+                    try:
+                        self.workflow_tab.turntable_panel.set_status(str(err))
+                    except Exception:
+                        pass
+                    try:
+                        self.workflow_tab.linear_axis_panel.set_status(str(err))
+                    except Exception:
+                        pass
+                    self._plc_axis_cal_last = None
+
+            self._plc_connected_last = connected
+
+            st = getattr(snap, "status", None)
+            if not connected or st is None:
+                return
+
+            # Surface PLC safety/health issues without spamming every poll.
+            try:
+                problems = []
+                if bool(getattr(st, "door_open", False)):
+                    problems.append("Door open")
+                if bool(getattr(st, "sys_halted", False)):
+                    problems.append("HALTED")
+                if bool(getattr(st, "sys_fault", False)):
+                    problems.append(f"FAULT code {int(getattr(st, 'sys_fault_code', 0) or 0)}")
+                if hasattr(st, "watchdog_ok") and not bool(getattr(st, "watchdog_ok", True)):
+                    problems.append("Watchdog not OK")
+                if hasattr(st, "allow_motion_active") and not bool(getattr(st, "allow_motion_active", True)):
+                    problems.append("ALLOW_MOTION off")
+
+                health = " | ".join(problems)
+                if health != self._plc_health_last:
+                    if health:
+                        msg = f"[PLC] {health}"
+                    else:
+                        msg = f"Connected ({endpoint})." if endpoint else "Connected."
+                    try:
+                        self.workflow_tab.turntable_panel.set_status(msg)
+                    except Exception:
+                        pass
+                    try:
+                        self.workflow_tab.linear_axis_panel.set_status(msg)
+                    except Exception:
+                        pass
+                    self._plc_health_last = health
+            except Exception:
+                pass
+
+            cal = bool(getattr(st, "act_calib_valid", False))
+            total = int(getattr(st, "act_calib_total_steps", 0) or 0)
+            pos_steps = int(getattr(st, "act_pos_steps", 0) or 0)
+            try:
+                act_target_steps = int(getattr(st, "act_target_steps", 0) or 0)
+            except Exception:
+                act_target_steps = None
+            try:
+                act_in_motion = bool(getattr(st, "act_in_motion", False))
+            except Exception:
+                act_in_motion = None
+            try:
+                act_state = int(getattr(st, "act_state", 0) or 0)
+            except Exception:
+                act_state = None
+            try:
+                act_fault_code = int(getattr(st, "act_fault_code", 0) or 0)
+            except Exception:
+                act_fault_code = None
+
+            # Update read-only PLC axis details (does not touch goto input).
+            try:
+                self.workflow_tab.linear_axis_panel.set_plc_axis_snapshot(
+                    position_steps=pos_steps,
+                    target_steps=act_target_steps,
+                    in_motion=act_in_motion,
+                    act_state=act_state,
+                    act_fault_code=act_fault_code,
+                    calibrated=cal,
+                    total_steps=total if total > 0 else None,
+                )
+            except Exception:
+                pass
+
+            # One-time migration: convert legacy mm home/last into steps when calibration total is known.
+            try:
+                if total > 0:
+                    cfg = state()
+                    if getattr(cfg, "linear_axis_home_steps", None) is None:
+                        hm = getattr(cfg, "linear_axis_home_mm", None)
+                        if hm is not None:
+                            hs = int(round((float(hm) / 100.0) * float(total)))
+                            cfg.linear_axis_home_steps = max(0, min(hs, total))
+                            save_state()
+                            try:
+                                self.workflow_tab.linear_axis_panel.set_home_steps(int(cfg.linear_axis_home_steps))
+                            except Exception:
+                                pass
+                    if getattr(cfg, "linear_axis_last_steps", None) is None:
+                        lm = getattr(cfg, "linear_axis_last_mm", None)
+                        if lm is not None:
+                            ls = int(round((float(lm) / 100.0) * float(total)))
+                            cfg.linear_axis_last_steps = max(0, min(ls, total))
+                            save_state()
+            except Exception:
+                pass
+
+            if self._plc_axis_cal_last is None or cal != self._plc_axis_cal_last:
+                try:
+                    self.workflow_tab.linear_axis_panel.set_calibrated(cal, pos_steps if cal else None, total_steps=total if total > 0 else None)
+                except Exception:
+                    pass
+                self._plc_axis_cal_last = cal
+        except Exception:
+            pass
+
     def _handle_turntable_message(self, msg: str):
-        self.workflow_tab.append_log(f"[Turntable] {msg}")
+        # PLC and motion messages are forwarded via the shared channel.
+        if (msg or "").startswith("[PLC]"):
+            self.workflow_tab.append_log(msg)
+        else:
+            self.workflow_tab.append_log(f"[PLC] {msg}")
 
     def _handle_turntable_status(self, status: str):
         self.workflow_tab.turntable_panel.set_status(status)
@@ -1425,69 +1725,14 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=run, daemon=True).start()
 
-    # Linear axis handlers
-    def _on_axis_raw_message(self, msg: str):
-        if msg:
-            try:
-                from PyQt5.QtCore import QTimer as _QTimer
-                # Queue log to UI thread to avoid cross-thread QTextEdit access
-                _QTimer.singleShot(0, lambda m=msg: self.workflow_tab.append_log(f"[Axis] {m}"))
-            except Exception:
-                pass
-            try:
-                from PyQt5.QtCore import QTimer as _QTimer
-                import re
-                banner = msg.lower()
-                # Mark controller ready once any banner/command text shows up
-                if not self.workflow_tab.linear_axis_panel.is_ready():
-                    if ("fuyu linear axis controller" in banner) or ("commands:" in banner) or ("stroke assumed" in banner):
-                        self._axis_ui.set_ready.emit(True)
-                # Detect calibration start/complete from device prints
-                if "[cal]" in banner:
-                    if "starting calibration" in banner:
-                        self._axis_ui.set_calibrating.emit(True)
-                    if "calibration complete" in banner or "right limit reached" in banner:
-                        # Treat device message as authoritative end of calibration
-                        self._axis_ui.set_calibrating.emit(False)
-                        self._axis_ui.set_calibrated.emit(True, None)
-                        self._axis_ui.set_ready.emit(True)
-                # Detect calibration info output (R command)
-                if "calibrated:" in banner:
-                    pos_match = re.search(r"currentpos[:\s]+([-+]?\d+(?:\.\d+)?)", banner)
-                    pos_val = None
-                    if pos_match:
-                        try:
-                            pos_val = float(pos_match.group(1))
-                        except Exception:
-                            pos_val = None
-                    if "yes" in banner:
-                        def _apply_info(p=pos_val):
-                            # Treat R output as authoritative end-of-calibration signal
-                            self._axis_ui.set_calibrating.emit(False)
-                            self._axis_ui.set_calibrated.emit(True, p)
-                            self._axis_ui.set_ready.emit(True)
-
-                        _apply_info()
-                # Update position if reported
-                if "[move] current position" in banner or "current position:" in banner or "currentpos" in banner:
-                    m = re.search(r"([-+]?\d+(?:\.\d+)?)\s*mm", banner)
-                    if m:
-                        try:
-                            pos = float(m.group(1))
-                            self._axis_ui.set_position.emit(pos)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
     def on_axis_refresh(self):
         try:
             ports = linear_axis_service.refresh_devices()
             self.workflow_tab.linear_axis_panel.set_ports(ports)
             st = state()
-            if st.linear_axis_port:
+            if getattr(st, "plc_host", None):
                 combo = self.workflow_tab.linear_axis_panel.port_combo
-                idx = combo.findText(st.linear_axis_port)
+                idx = combo.findText(str(st.plc_host))
                 if idx >= 0:
                     combo.setCurrentIndex(idx)
         except Exception as ex:
@@ -1496,31 +1741,45 @@ class MainWindow(QMainWindow):
     def on_axis_connect(self, port: str):
         from PyQt5.QtCore import QTimer as _QTimer
         if linear_axis_service.connect(port):
-            _QTimer.singleShot(0, lambda: self.workflow_tab.linear_axis_panel.set_connected(True, port))
-            _QTimer.singleShot(0, lambda: self.workflow_tab.linear_axis_panel.set_ready(False))
-            _QTimer.singleShot(0, lambda: self.workflow_tab.append_log(f"[Axis] Connected to {port}."))
-            st = state(); st.linear_axis_port = port; save_state()
-            # Attach listener once connected
+            endpoint = linear_axis_service.port_name() or port
+            _QTimer.singleShot(0, lambda ep=endpoint: self.workflow_tab.linear_axis_panel.set_connected(True, ep))
+            _QTimer.singleShot(0, lambda: self.workflow_tab.linear_axis_panel.set_ready(True))
+            _QTimer.singleShot(0, lambda ep=endpoint: self.workflow_tab.append_log(f"[PLC] Connected to {ep}."))
+            # PLC is shared; reflect connection in turntable panel too.
             try:
-                linear_axis_service.add_listener(self._on_axis_raw_message)
+                _QTimer.singleShot(0, lambda ep=endpoint: self.workflow_tab.turntable_panel.set_connected(True, ep))
             except Exception:
                 pass
-            # Fallback: if controller banner not seen soon, allow calibration anyway
-            _QTimer.singleShot(1000, lambda: self.workflow_tab.linear_axis_panel.set_ready(True) if not self.workflow_tab.linear_axis_panel.is_ready() else None)
+            try:
+                st = state()
+                st.plc_host = str(port).split(":", 1)[0].strip() or str(port).strip()
+                save_state()
+            except Exception:
+                pass
             # Apply persisted home value on connect
             try:
-                home_mm = float(state().linear_axis_home_mm) if state().linear_axis_home_mm is not None else 50.0
-                self.workflow_tab.linear_axis_panel.set_home_mm(home_mm)
+                cfg = state()
+                hs = getattr(cfg, "linear_axis_home_steps", None)
+                if hs is None:
+                    hs = getattr(cfg, "linear_axis_last_steps", None)
+                if hs is None:
+                    hs = 0
+                _QTimer.singleShot(0, lambda steps=int(hs): self.workflow_tab.linear_axis_panel.set_home_steps(steps))
+            except Exception:
+                pass
+            # Seed calibration/position state from PLC status
+            try:
+                cal = linear_axis_service.is_calibrated()
+                pos_steps = linear_axis_service.current_position_steps()
+                total_steps = linear_axis_service.calibration_total_steps()
+                _QTimer.singleShot(
+                    0,
+                    lambda c=cal, p=pos_steps, t=total_steps: self.workflow_tab.linear_axis_panel.set_calibrated(bool(c), p if c else None, total_steps=t),
+                )
             except Exception:
                 pass
         else:
-            _QTimer.singleShot(0, lambda: self.workflow_tab.append_log(f"[Axis] Connection failed for {port}."))
-
-    def on_axis_disconnect(self):
-        from PyQt5.QtCore import QTimer as _QTimer
-        linear_axis_service.disconnect()
-        _QTimer.singleShot(0, lambda: self.workflow_tab.linear_axis_panel.set_connected(False))
-        _QTimer.singleShot(0, lambda: self.workflow_tab.append_log("[Axis] Disconnected."))
+            _QTimer.singleShot(0, lambda: self.workflow_tab.append_log(f"[PLC] Connection failed for {port}: {plc_service.last_error() or ''}".strip()))
 
     def on_axis_calibrate(self):
         import threading
@@ -1532,45 +1791,61 @@ class MainWindow(QMainWindow):
                 return
         except Exception:
             pass
+        # If the PLC already reports a valid calibration, do not re-run it.
+        try:
+            if linear_axis_service.is_calibrated():
+                self.workflow_tab.append_log("[Axis] Already calibrated (PLC reports calibration valid). Skipping calibration.")
+                try:
+                    pos_steps = linear_axis_service.current_position_steps()
+                    total_steps = linear_axis_service.calibration_total_steps()
+                    self._axis_ui.set_calibrated.emit(True, pos_steps, total_steps)
+                    self._axis_ui.set_ready.emit(True)
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
 
         def run():
             self._axis_ui.set_calibrating.emit(True)
             try:
                 try:
-                    home_mm = float(self.workflow_tab.linear_axis_panel.home_mm())
+                    home_steps = int(self.workflow_tab.linear_axis_panel.home_steps())
                 except Exception:
-                    home_mm = 50.0
-                res = linear_axis_service.calibrate_and_home(home_mm=home_mm)
+                    home_steps = 0
+                res = linear_axis_service.calibrate_and_home(home_steps=home_steps)
                 self.workflow_tab.append_log(res.message)
-                pos = linear_axis_service.current_position_mm()
+                pos_steps = linear_axis_service.current_position_steps()
+                total_steps = linear_axis_service.calibration_total_steps()
                 if res.success:
                     # Optimistically unlock UI immediately after calibration/home succeeds
-                    self._axis_ui.set_calibrated.emit(True, pos)
+                    self._axis_ui.set_calibrated.emit(True, pos_steps, total_steps)
                     self._axis_ui.set_ready.emit(True)
                     try:
-                        self.workflow_tab.append_log("[Axis] Reading calibration info (R)...")
+                        self.workflow_tab.append_log("[Axis] Reading calibration status...")
                         info_res = linear_axis_service.read_calibration_info()
                     except Exception as info_ex:
                         info_res = None
                         self.workflow_tab.append_log(f"[Axis] Read calibration info failed: {info_ex}")
                     if info_res is not None:
                         self.workflow_tab.append_log(info_res.message)
-                        pos_for_ui = info_res.position_mm if info_res.position_mm is not None else pos
+                        pos_for_ui = info_res.position_steps if info_res.position_steps is not None else pos_steps
+                        tot_for_ui = info_res.total_steps if info_res.total_steps is not None else total_steps
                         if info_res.success:
-                            self._axis_ui.set_calibrated.emit(True, pos_for_ui)
+                            self._axis_ui.set_calibrated.emit(True, pos_for_ui, tot_for_ui)
                             self._axis_ui.set_ready.emit(True)
                             try:
-                                st = state(); st.linear_axis_last_mm = pos_for_ui; save_state()
+                                st = state(); st.linear_axis_last_steps = int(pos_for_ui) if pos_for_ui is not None else None; save_state()
                             except Exception:
                                 pass
                         else:
-                            self._axis_ui.set_calibrated.emit(True, pos_for_ui)
+                            self._axis_ui.set_calibrated.emit(True, pos_for_ui, tot_for_ui)
                             self._axis_ui.set_ready.emit(True)
                     else:
-                        self._axis_ui.set_calibrated.emit(True, pos)
+                        self._axis_ui.set_calibrated.emit(True, pos_steps, total_steps)
                         self._axis_ui.set_ready.emit(True)
                 else:
-                    self._axis_ui.set_calibrated.emit(False, pos)
+                    self._axis_ui.set_calibrated.emit(False, pos_steps, total_steps)
             except Exception as ex:
                 self.workflow_tab.append_log(f"[Axis] Calibration failed: {ex}")
             finally:
@@ -1578,18 +1853,19 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=run, daemon=True).start()
 
-    def on_axis_home(self, home_mm: float):
+    def on_axis_home(self, home_steps: int):
         import threading
 
         def run():
             try:
-                res = linear_axis_service.home(home_mm=home_mm)
+                res = linear_axis_service.home(home_steps=int(home_steps))
                 self.workflow_tab.append_log(res.message)
                 if res.success:
-                    pos = linear_axis_service.current_position_mm()
-                    self._axis_ui.set_calibrated.emit(True, pos)
+                    pos_steps = linear_axis_service.current_position_steps()
+                    total_steps = linear_axis_service.calibration_total_steps()
+                    self._axis_ui.set_calibrated.emit(True, pos_steps, total_steps)
                     try:
-                        st = state(); st.linear_axis_last_mm = pos; save_state()
+                        st = state(); st.linear_axis_last_steps = int(pos_steps) if pos_steps is not None else None; save_state()
                     except Exception:
                         pass
             except Exception as ex:
@@ -1597,18 +1873,19 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=run, daemon=True).start()
 
-    def on_axis_goto(self, target_mm: float):
+    def on_axis_goto(self, target_steps: int):
         import threading
 
         def run():
             try:
-                res = linear_axis_service.goto_mm(target_mm)
+                res = linear_axis_service.goto_steps(int(target_steps))
                 self.workflow_tab.append_log(res.message)
                 if res.success:
-                    pos = linear_axis_service.current_position_mm()
-                    self._axis_ui.set_calibrated.emit(True, pos)
+                    pos_steps = linear_axis_service.current_position_steps()
+                    total_steps = linear_axis_service.calibration_total_steps()
+                    self._axis_ui.set_calibrated.emit(True, pos_steps, total_steps)
                     try:
-                        st = state(); st.linear_axis_last_mm = pos; save_state()
+                        st = state(); st.linear_axis_last_steps = int(pos_steps) if pos_steps is not None else None; save_state()
                     except Exception:
                         pass
             except Exception as ex:
@@ -1616,10 +1893,10 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=run, daemon=True).start()
 
-    def on_axis_home_set(self, home_mm: float):
+    def on_axis_home_set(self, home_steps: int):
         try:
-            st = state(); st.linear_axis_home_mm = float(home_mm); save_state()
-            self.workflow_tab.append_log(f"[Axis] Home position set to {home_mm:.1f} mm.")
+            st = state(); st.linear_axis_home_steps = int(home_steps); save_state()
+            self.workflow_tab.append_log(f"[Axis] Home position set to {int(home_steps)} steps.")
         except Exception:
             pass
 
@@ -2101,30 +2378,18 @@ class MainWindow(QMainWindow):
             backend = camera_service.backend_name()
             self.workflow_tab.append_log(f"[Camera] Backend(s): {backend} | Found {len(devices)} device(s).")
             if len(devices) == 0:
-                diag = camera_service.diagnostics()
-                # Log iRAYPLE diagnostics when present (for SDK path issues)
-                iray = diag.get("iRAYPLE") or {}
-                py_dir = iray.get("py_dir")
-                rt_dir = iray.get("runtime_dir")
-                enum_ret = iray.get("enum_ret")
-                dev_num = iray.get("dev_num")
-                version = iray.get("version")
-                import_ok = iray.get("import_ok")
-                load_error = iray.get("load_error")
-                if version:
-                    self.workflow_tab.append_log(f"[Camera] iRAYPLE SDK version: {version}")
-                if py_dir or rt_dir:
-                    self.workflow_tab.append_log(f"[Camera] iRAYPLE paths: PY={py_dir} RT={rt_dir}")
-                if enum_ret is not None or dev_num is not None:
-                    self.workflow_tab.append_log(f"[Camera] iRAYPLE enum result: ret={enum_ret} dev_num={dev_num}")
-                if import_ok is not None:
-                    self.workflow_tab.append_log(f"[Camera] iRAYPLE import_ok={import_ok}")
-                if load_error:
-                    try:
-                        last_line = str(load_error).splitlines()[-1]
-                    except Exception:
-                        last_line = str(load_error)
-                    self.workflow_tab.append_log(f"[Camera] iRAYPLE load_error: {last_line}")
+                diag = camera_service.diagnostics() or {}
+                harv = diag.get("HARVESTERS") or {}
+                gentl = harv.get("gentl_file_resolved") or harv.get("gentl_file")
+                if gentl:
+                    self.workflow_tab.append_log(f"[Camera] GenTL producer: {gentl}")
+                err = harv.get("last_error") or harv.get("load_error")
+                if err:
+                    self.workflow_tab.append_log(f"[Camera] Harvester error: {err}")
+                dev_num = harv.get("dev_num")
+                gige_num = harv.get("gige_dev_num")
+                if dev_num is not None or gige_num is not None:
+                    self.workflow_tab.append_log(f"[Camera] GenTL devices: total={dev_num} gige={gige_num}")
         except Exception as ex:
             self.workflow_tab.append_log(f"[Camera] Enumeration failed: {ex}")
 
@@ -2157,8 +2422,8 @@ class MainWindow(QMainWindow):
             else:
                 st.camera_front_index = index
             save_state()
-            # Auto-capture on connect
-            self.on_camera_capture(role)
+            self._bump_live(role)
+            self._start_live_feed()
         else:
             self.workflow_tab.append_log(f"[Camera] {role} connection failed for index {index}.")
 
@@ -2166,18 +2431,119 @@ class MainWindow(QMainWindow):
         camera_service.disconnect(role)
         self.workflow_tab.camera_panel.set_connected(role, False)
         self.workflow_tab.append_log(f"[Camera] {role} disconnected.")
+        self._bump_live(role)
+        self._stop_live_if_idle()
 
-    def on_camera_capture(self, role: str):
+    def _bump_live(self, role: str):
+        role_norm = "Top" if role == "Top" else "Front"
         try:
-            frame = cammgr.capture(role)
-            pm = np_bgr_to_qpixmap(frame)
-            if role == "Top":
-                self.preview_panel.set_original_np(pm)
-            else:
-                self.preview_panel.set_front_np(pm)
-            self.workflow_tab.append_log(f"[Camera] Captured preview from {role.lower()} camera.")
-        except Exception as ex:
-            self.workflow_tab.append_log(f"[Camera] Capture failed on {role}: {ex}")
+            self._live_gen[role_norm] = int(self._live_gen.get(role_norm, 0) or 0) + 1
+        except Exception:
+            pass
+
+    def _start_live_feed(self):
+        if self._live_closed:
+            return
+        self._live_enabled = True
+        try:
+            if not self._live_timer.isActive():
+                self._live_timer.start()
+        except Exception:
+            pass
+
+    def _stop_live_feed(self):
+        self._live_enabled = False
+        try:
+            self._live_timer.stop()
+        except Exception:
+            pass
+        try:
+            self._live_gen["Top"] = int(self._live_gen.get("Top", 0) or 0) + 1
+            self._live_gen["Front"] = int(self._live_gen.get("Front", 0) or 0) + 1
+        except Exception:
+            pass
+        try:
+            self._live_inflight["Top"] = None
+            self._live_inflight["Front"] = None
+        except Exception:
+            pass
+
+    def _stop_live_if_idle(self):
+        try:
+            if not camera_service.is_connected("Top") and not camera_service.is_connected("Front"):
+                self._stop_live_feed()
+        except Exception:
+            pass
+
+    def _on_live_tick(self):
+        if self._live_closed or not self._live_enabled:
+            return
+
+        top_ok = bool(camera_service.is_connected("Top"))
+        front_ok = bool(camera_service.is_connected("Front"))
+        if not top_ok and not front_ok:
+            self._stop_live_feed()
+            return
+
+        def _schedule(role: str):
+            if not camera_service.is_connected(role):
+                return
+            fut = self._live_inflight.get(role)
+            if fut is not None and not fut.done():
+                return
+            gen = int(self._live_gen.get(role, 0) or 0)
+            fut = self._live_executor.submit(cammgr.capture_live, role)
+            self._live_inflight[role] = fut
+
+            def _done(_fut, role_inner=role, gen_inner=gen):
+                try:
+                    self._live_inflight[role_inner] = None
+                except Exception:
+                    pass
+                if self._live_closed:
+                    return
+                try:
+                    frame = _fut.result()
+                except Exception as ex:
+                    err = str(ex)
+                    try:
+                        err_short = str(err).splitlines()[-1].strip()
+                    except Exception:
+                        err_short = str(err)
+                    try:
+                        self.live_error_ready.emit(role_inner, int(gen_inner), str(err_short), str(err))
+                    except Exception:
+                        pass
+                    return
+
+                if frame is None:
+                    return
+                try:
+                    self.live_frame_ready.emit(role_inner, int(gen_inner), frame)
+                except Exception:
+                    pass
+
+            try:
+                fut.add_done_callback(_done)
+            except Exception:
+                pass
+
+        _schedule("Top")
+        _schedule("Front")
+
+    def _shutdown_live_feed(self):
+        self._live_closed = True
+        try:
+            self._live_timer.stop()
+        except Exception:
+            pass
+        try:
+            self._live_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            try:
+                self._live_executor.shutdown(wait=False)
+            except Exception:
+                pass
 
     def on_camera_selected(self, role: str, index: int):
         # Save selection without auto-connecting
@@ -2294,10 +2660,18 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         try:
+            try:
+                self._shutdown_live_feed()
+            except Exception:
+                pass
             camera_service.release_all()
             if hasattr(self, "_tt_listener") and self._tt_listener:
                 turntable_service.remove_listener(self._tt_listener)
-            turntable_service.disconnect()
+            try:
+                plc_service.remove_status_listener(self._on_plc_snapshot_raw)
+            except Exception:
+                pass
+            plc_service.disconnect()
             try:
                 solvision_manager.dispose()
             except Exception:
