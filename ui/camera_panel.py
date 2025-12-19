@@ -14,7 +14,6 @@ from PyQt5.QtWidgets import (
 class _RoleWidget(QWidget):
     selection_changed = pyqtSignal(str, int)
     connect_clicked = pyqtSignal(str)
-    capture_clicked = pyqtSignal(str)
 
     def __init__(self, role: str, header: str, parent=None):
         super().__init__(parent)
@@ -40,14 +39,13 @@ class _RoleWidget(QWidget):
         self.bt_connect.setEnabled(False)
         self._apply_connect_style(False)
         row.addWidget(self.bt_connect)
-        self.bt_capture = QPushButton("Capture Preview")
-        self.bt_capture.clicked.connect(self._on_capture)
-        self.bt_capture.setEnabled(False)
-        row.addWidget(self.bt_capture)
         layout.addLayout(row)
 
         self.status_label = QLabel("Camera not connected.")
         layout.addWidget(self.status_label)
+        self.stream_label = QLabel("")
+        self.stream_label.setStyleSheet("color: #666;")
+        layout.addWidget(self.stream_label)
 
     def _on_selection_changed(self, _idx: int):
         data = self.selector.currentData()
@@ -57,9 +55,6 @@ class _RoleWidget(QWidget):
 
     def _on_connect(self):
         self.connect_clicked.emit(self.role)
-
-    def _on_capture(self):
-        self.capture_clicked.emit(self.role)
 
     def set_devices(self, devices: List[Dict]):
         current = self.selector.currentData()
@@ -86,12 +81,14 @@ class _RoleWidget(QWidget):
         self._connected = connected
         self.bt_connect.setText("Disconnect" if connected else "Connect Camera")
         self.bt_connect.setEnabled(connected or self.selected_device_index() is not None)
-        self.bt_capture.setEnabled(connected)
         self._apply_connect_style(connected)
-        if connected and device_name:
-            self.status_label.setText(f"Connected ({device_name}).")
+        if connected:
+            label = (device_name or "").strip() or (self.selector.currentText() or "").strip()
+            self.status_label.setText(f"Connected ({label})." if label else "Connected.")
+            self.stream_label.setText("Live feed: starting...")
         else:
             self.status_label.setText("Camera not connected.")
+            self.stream_label.setText("")
         self._refresh_detail()
 
     def _refresh_detail(self):
@@ -100,7 +97,7 @@ class _RoleWidget(QWidget):
         self.bt_connect.setEnabled(self._connected or has_selection)
         if self._connected:
             name = self.selector.currentText() or "device"
-            self.detail_label.setText(f"{name}\nCapture a frame to refresh the preview.")
+            self.detail_label.setText(f"{name}\nLive feed is active.")
         else:
             if has_selection:
                 name = self.selector.currentText()
@@ -138,12 +135,17 @@ class _RoleWidget(QWidget):
                 self.selector.setCurrentIndex(i)
                 break
 
+    def set_stream_status(self, text: str):
+        try:
+            self.stream_label.setText(str(text or ""))
+        except Exception:
+            pass
+
 
 class CameraPanel(QWidget):
     refresh_requested = pyqtSignal()
     connect_requested = pyqtSignal(str, int)
     disconnect_requested = pyqtSignal(str)
-    capture_requested = pyqtSignal(str)
     selection_changed = pyqtSignal(str, int)
 
     def __init__(self, parent=None):
@@ -160,7 +162,7 @@ class CameraPanel(QWidget):
         self.bt_refresh = QPushButton("Refresh Devices")
         self.bt_refresh.clicked.connect(self.refresh_requested)
         toolbar.addWidget(self.bt_refresh)
-        hint = QLabel("Assign top and front cameras, then capture a preview to verify the feed.")
+        hint = QLabel("Assign top and front cameras. Live feed updates automatically when connected.")
         toolbar.addWidget(hint)
         toolbar.addStretch(1)
         v.addLayout(toolbar)
@@ -171,8 +173,6 @@ class CameraPanel(QWidget):
 
         self.top.connect_clicked.connect(self._on_connect_clicked)
         self.front.connect_clicked.connect(self._on_connect_clicked)
-        self.top.capture_clicked.connect(self.capture_requested)
-        self.front.capture_clicked.connect(self.capture_requested)
         self.top.selection_changed.connect(self.selection_changed)
         self.front.selection_changed.connect(self.selection_changed)
 
@@ -189,6 +189,12 @@ class CameraPanel(QWidget):
             self.top.set_connected(connected, device_name)
         else:
             self.front.set_connected(connected, device_name)
+
+    def set_stream_status(self, role: str, text: str):
+        if role == "Top":
+            self.top.set_stream_status(text)
+        else:
+            self.front.set_stream_status(text)
 
     def selected_index(self, role: str) -> Optional[int]:
         return self.top.selected_device_index() if role == "Top" else self.front.selected_device_index()

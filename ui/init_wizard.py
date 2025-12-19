@@ -1,4 +1,4 @@
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QDialog,
     QVBoxLayout,
@@ -12,12 +12,15 @@ from PyQt5.QtWidgets import (
 
 from .camera_panel import CameraPanel
 from .image_preview_panel import ImagePreviewPanel
-from .turntable_panel import TurntablePanel
-from services import camera_service, turntable_service
+from .plc_panel import PlcPanel
+from services import camera_service, plc_service
 from services.config import settings, state, save_state
 
 
 class InitWizard(QDialog):
+    live_frame_ready = pyqtSignal(str, int, object)  # (role, gen, frame)
+    live_error_ready = pyqtSignal(str, int, str)  # (role, gen, err_short)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Initialization")
@@ -34,7 +37,7 @@ class InitWizard(QDialog):
             h = QHBoxLayout()
             h.addWidget(QLabel(label))
             le = QLineEdit()
-            btn = QPushButton("Browse…")
+            btn = QPushButton("Browse...")
             h.addWidget(le, stretch=1)
             h.addWidget(btn)
             return h, le, btn
@@ -65,9 +68,9 @@ class InitWizard(QDialog):
         self.preview_panel = ImagePreviewPanel()
         root.addWidget(self.preview_panel)
 
-        # Turntable group
-        self.tt_panel = TurntablePanel()
-        root.addWidget(self.tt_panel)
+        # PLC connection
+        self.plc_panel = PlcPanel()
+        root.addWidget(self.plc_panel)
 
         # Bottom row
         bottom = QHBoxLayout()
@@ -79,20 +82,30 @@ class InitWizard(QDialog):
         bottom.addWidget(self.bt_begin)
         root.addLayout(bottom)
 
+        # Live camera feed (no manual capture button)
+        import concurrent.futures
+
+        self._live_enabled = False
+        self._live_closed = False
+        self._live_timer = QTimer(self)
+        self._live_timer.setInterval(50)
+        self._live_timer.timeout.connect(self._on_live_tick)
+        self._live_gen = {"Top": 0, "Front": 0}
+        self._live_inflight = {"Top": None, "Front": None}
+        self._live_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        self.live_frame_ready.connect(self._on_live_frame_ready)
+        self.live_error_ready.connect(self._on_live_error_ready)
+
         # Wire cameras
         self.cam_panel.refresh_requested.connect(self.on_cam_refresh)
         self.cam_panel.connect_requested.connect(self.on_cam_connect)
         self.cam_panel.disconnect_requested.connect(self.on_cam_disconnect)
-        self.cam_panel.capture_requested.connect(self.on_cam_capture)
         self.on_cam_refresh()
 
-        # Wire turntable
-        self.tt_panel.refresh_requested.connect(self.on_tt_refresh)
-        self.tt_panel.connect_requested.connect(self.on_tt_connect)
-        self.tt_panel.disconnect_requested.connect(self.on_tt_disconnect)
-        self.tt_panel.home_requested.connect(self.on_tt_home)
-        self.tt_panel.rotate_requested.connect(self.on_tt_rotate)
-        self.on_tt_refresh()
+        # Wire PLC
+        self.plc_panel.refresh_requested.connect(self.on_plc_refresh)
+        self.plc_panel.connect_requested.connect(self.on_plc_connect)
+        self.on_plc_refresh()
 
         # Buttons
         self.bt_cancel.clicked.connect(self.reject)
@@ -112,6 +125,50 @@ class InitWizard(QDialog):
         self.le_attach.textChanged.connect(self._update_ready)
         self.le_front.textChanged.connect(self._update_ready)
         self.le_defect.textChanged.connect(self._update_ready)
+
+    def _on_live_frame_ready(self, role: str, gen: int, frame):
+        if self._live_closed or not self._live_enabled:
+            return
+        role_norm = "Top" if role == "Top" else "Front"
+        try:
+            if int(self._live_gen.get(role_norm, 0) or 0) != int(gen):
+                return
+        except Exception:
+            return
+        if frame is None:
+            return
+        try:
+            from .qt_image import np_bgr_to_qpixmap
+
+            pm = np_bgr_to_qpixmap(frame)
+            if pm is None or pm.isNull():
+                return
+            if role_norm == "Top":
+                self.preview_panel.set_original_np(pm)
+                settings().top_preview_np = frame
+            else:
+                self.preview_panel.set_front_np(pm)
+                settings().front_preview_np = frame
+            try:
+                self.cam_panel.set_stream_status(role_norm, "Live feed: OK")
+            except Exception:
+                pass
+        except Exception:
+            return
+
+    def _on_live_error_ready(self, role: str, gen: int, err_short: str):
+        if self._live_closed or not self._live_enabled:
+            return
+        role_norm = "Top" if role == "Top" else "Front"
+        try:
+            if int(self._live_gen.get(role_norm, 0) or 0) != int(gen):
+                return
+        except Exception:
+            return
+        try:
+            self.cam_panel.set_stream_status(role_norm, f"Live feed: error ({err_short})")
+        except Exception:
+            pass
 
     # Cameras
     def on_cam_refresh(self):
@@ -142,74 +199,158 @@ class InitWizard(QDialog):
             else:
                 st.camera_front_index = index
             save_state()
-            # Auto-capture on connect
-            self.on_cam_capture(role)
+            self._start_live()
         self._update_ready()
 
     def on_cam_disconnect(self, role: str):
         camera_service.disconnect(role)
         self.cam_panel.set_connected(role, False)
+        self._bump_live(role)
+        self._stop_live_if_idle()
         self._update_ready()
 
-    def on_cam_capture(self, role: str):
+    def _bump_live(self, role: str):
         try:
+            self._live_gen["Top" if role == "Top" else "Front"] += 1
+        except Exception:
+            pass
+
+    def _start_live(self):
+        if self._live_closed:
+            return
+        self._live_enabled = True
+        try:
+            if not self._live_timer.isActive():
+                self._live_timer.start()
+        except Exception:
+            pass
+
+    def _stop_live_if_idle(self):
+        try:
+            if not camera_service.is_connected("Top") and not camera_service.is_connected("Front"):
+                self._live_enabled = False
+                self._live_timer.stop()
+        except Exception:
+            pass
+
+    def _on_live_tick(self):
+        if self._live_closed or not self._live_enabled:
+            return
+
+        top_ok = bool(camera_service.is_connected("Top"))
+        front_ok = bool(camera_service.is_connected("Front"))
+        if not top_ok and not front_ok:
+            self._stop_live_if_idle()
+            return
+
+        def _schedule(role: str):
+            if not camera_service.is_connected(role):
+                return
+            fut = self._live_inflight.get(role)
+            if fut is not None and not fut.done():
+                return
+            gen = int(self._live_gen.get(role, 0) or 0)
             from services import camera_manager as _cammgr
-            frame = _cammgr.capture(role)
-            from .qt_image import np_bgr_to_qpixmap
-            pm = np_bgr_to_qpixmap(frame)
-            if role == "Top":
-                self.preview_panel.set_original_np(pm)
-                settings().top_preview_np = frame
-            else:
-                self.preview_panel.set_front_np(pm)
-                settings().front_preview_np = frame
-        except Exception:
-            pass
 
-    # Turntable
-    def on_tt_refresh(self):
-        try:
-            ports = turntable_service.refresh_devices()
-            self.tt_panel.set_ports(ports)
-            st = state()
-            if st.turntable_port:
-                idx = self.tt_panel.port_combo.findText(st.turntable_port)
-                if idx >= 0:
-                    self.tt_panel.port_combo.setCurrentIndex(idx)
-        except Exception:
-            pass
+            fut = self._live_executor.submit(_cammgr.capture_live, role)
+            self._live_inflight[role] = fut
 
-    def on_tt_connect(self, port: str):
-        if turntable_service.connect(port):
-            self.tt_panel.set_connected(True, port)
-            st = state()
-            st.turntable_port = port
-            st.turntable_step = float(self.tt_panel.step.value())
-            save_state()
-        self._update_ready()
+            def _done(_fut, role_inner=role, gen_inner=gen):
+                try:
+                    self._live_inflight[role_inner] = None
+                except Exception:
+                    pass
+                if self._live_closed:
+                    return
+                try:
+                    frame = _fut.result()
+                except Exception:
+                    try:
+                        err = str(_fut.exception() or "capture failed")
+                        err_short = str(err).splitlines()[-1].strip()
+                    except Exception:
+                        err_short = "capture failed"
+                    try:
+                        self.live_error_ready.emit(role_inner, int(gen_inner), str(err_short))
+                    except Exception:
+                        pass
+                    return
+                if frame is None:
+                    return
+                try:
+                    self.live_frame_ready.emit(role_inner, int(gen_inner), frame)
+                except Exception:
+                    pass
 
-    def on_tt_disconnect(self):
-        turntable_service.disconnect()
-        self.tt_panel.set_connected(False)
-        self._update_ready()
-
-    def on_tt_home(self):
-        import threading
-        def run():
-            res = turntable_service.home()
-            self.tt_panel.set_status(res.message)
-            self._update_ready()
-        threading.Thread(target=run, daemon=True).start()
-
-    def on_tt_rotate(self, angle: float):
-        import threading
-        def run():
             try:
-                msg = turntable_service.move_relative(angle)
-                self.tt_panel.set_status(msg)
-            except Exception as ex:
-                self.tt_panel.set_status(str(ex))
-        threading.Thread(target=run, daemon=True).start()
+                fut.add_done_callback(_done)
+            except Exception:
+                pass
+
+        _schedule("Top")
+        _schedule("Front")
+
+    def _shutdown_live(self):
+        self._live_closed = True
+        self._live_enabled = False
+        try:
+            self._live_timer.stop()
+        except Exception:
+            pass
+        try:
+            self._live_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            try:
+                self._live_executor.shutdown(wait=False)
+            except Exception:
+                pass
+
+    # PLC
+    def on_plc_refresh(self):
+        try:
+            # Reuse the motion service host list as the source of known endpoints.
+            from services import turntable_service
+
+            hosts = turntable_service.refresh_devices()
+            self.plc_panel.set_hosts(hosts)
+            st = state()
+            if getattr(st, "plc_host", None):
+                idx = self.plc_panel.host_combo.findText(str(st.plc_host))
+                if idx >= 0:
+                    self.plc_panel.host_combo.setCurrentIndex(idx)
+        except Exception:
+            pass
+
+    def on_plc_connect(self, host: str):
+        # Allow "host:port" input for convenience.
+        host_str = str(host or "").strip()
+        port_override = None
+        if ":" in host_str and host_str.count(":") == 1:
+            h, p = host_str.split(":", 1)
+            host_str = h.strip()
+            try:
+                port_override = int(p.strip())
+            except Exception:
+                port_override = None
+
+        st = state()
+        plc_port = int(getattr(st, "plc_port", 502) or 502)
+        unit_id = int(getattr(st, "plc_unit_id", 255) or 255)
+        if port_override is not None:
+            plc_port = int(port_override)
+
+        if plc_service.connect(host_str, port=plc_port, unit_id=unit_id, force_reconnect=True):
+            try:
+                st.plc_host = host_str
+                st.plc_port = plc_port
+                st.plc_unit_id = unit_id
+                save_state()
+            except Exception:
+                pass
+            self.plc_panel.set_connected(True, plc_service.endpoint() or host_str)
+        else:
+            self.plc_panel.set_connected(False, plc_service.last_error() or "PLC connection failed.")
+        self._update_ready()
 
     def _update_ready(self):
         # Persist into settings
@@ -227,16 +368,26 @@ class InitWizard(QDialog):
             camera_service.get_connected_index("Top") is not None and
             camera_service.get_connected_index("Front") is not None
         )
-        tt_ok = turntable_service.is_connected()
+        plc_ok = plc_service.is_connected()
         # Files optional for now
-        self.bt_begin.setEnabled(cams_ok and tt_ok)
+        self.bt_begin.setEnabled(cams_ok and plc_ok)
 
     def accept(self):
         # Save final selections before closing
+        try:
+            self._shutdown_live()
+        except Exception:
+            pass
         st = state()
         st.attachment_path = self.le_attach.text().strip() or None
         st.front_attachment_path = self.le_front.text().strip() or None
         st.defect_path = self.le_defect.text().strip() or None
-        st.turntable_step = float(self.tt_panel.step.value())
         save_state()
         super().accept()
+
+    def reject(self):
+        try:
+            self._shutdown_live()
+        except Exception:
+            pass
+        super().reject()
