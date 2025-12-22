@@ -1,22 +1,15 @@
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QPixmap, QPainter, QColor, QPen
 from PyQt5.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QGroupBox,
     QLabel,
-    QCheckBox,
-    QHBoxLayout,
-    QPushButton,
     QSplitter,
 )
 
 
 class ImagePreviewPanel(QWidget):
-    overlay_toggled = pyqtSignal(bool)
-    prev_requested = pyqtSignal()
-    next_requested = pyqtSignal()
-
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -43,31 +36,12 @@ class ImagePreviewPanel(QWidget):
         self.group_front = QGroupBox("4. Front Inspection")
         right_v = QVBoxLayout(self.group_front)
 
-        header = QHBoxLayout()
-        self.front_summary = QLabel("No inspection selected.")
-        header.addWidget(self.front_summary, stretch=1)
-        self.chk_overlay = QCheckBox("Show overlay")
-        self.chk_overlay.setChecked(True)
-        self.chk_overlay.toggled.connect(self.overlay_toggled)
-        header.addWidget(self.chk_overlay)
-        right_v.addLayout(header)
-
         self.front_label = QLabel()
         self.front_label.setStyleSheet("background: black;")
         self.front_label.setAlignment(Qt.AlignCenter)
         self.front_label.setMinimumSize(200, 150)
         self.front_label.setScaledContents(False)
         right_v.addWidget(self.front_label, stretch=1)
-
-        nav = QHBoxLayout()
-        self.bt_prev = QPushButton("Previous")
-        self.bt_prev.clicked.connect(self.prev_requested)
-        self.bt_next = QPushButton("Next")
-        self.bt_next.clicked.connect(self.next_requested)
-        nav.addWidget(self.bt_prev)
-        nav.addStretch(1)
-        nav.addWidget(self.bt_next)
-        right_v.addLayout(nav)
 
         splitter.addWidget(self.group_front)
         splitter.setStretchFactor(0, 1)
@@ -226,11 +200,11 @@ class ImagePreviewPanel(QWidget):
         return result
 
     def _apply_attachment_overlay(self, base: QPixmap, composed: QPixmap, target_w: int, target_h: int) -> QPixmap:
-        # Draw detection rectangles on the already scaled+cropped image.
+        # Draw detection markers (filled circles) on the already scaled+cropped image.
         if composed is None or composed.isNull():
             return composed
         result = QPixmap(composed)
-        from PyQt5.QtGui import QFont
+        from PyQt5.QtGui import QFont, QBrush
         painter = QPainter(result)
         painter.setRenderHint(QPainter.Antialiasing, True)
         # Compute scale and crop offsets used by _scale_and_crop
@@ -244,14 +218,16 @@ class ImagePreviewPanel(QWidget):
         scaled_h = int(bh * s)
         off_x = max(0, (scaled_w - target_w) // 2)
         off_y = max(0, (scaled_h - target_h) // 2)
-        # Styles
-        pen = QPen(QColor(0, 200, 83))  # green
-        pen.setWidth(2)
-        painter.setPen(pen)
-        font = QFont()
-        font.setPointSize(9)
-        painter.setFont(font)
-        # Draw each detection
+
+        def _color_for_state(state: str) -> QColor:
+            st = (state or "").lower()
+            if st == "fail":
+                return QColor(220, 20, 60, 150)  # red, semi-transparent
+            if st == "ok":
+                return QColor(46, 125, 50, 140)  # green, semi-transparent
+            return QColor(255, 215, 0, 140)  # yellow default
+
+        # Draw each detection as a filled circle with label + heading
         for d in self._attachment_detections:
             try:
                 b = d.get("bounds") or d.get("rect")
@@ -266,88 +242,32 @@ class ImagePreviewPanel(QWidget):
                 # Skip if fully outside
                 if dx + dw < 0 or dy + dh < 0 or dx > target_w or dy > target_h:
                     continue
-                # Optional polygon outline of detection
-                poly = d.get("polygon")
-                drew_poly = False
-                if isinstance(poly, (list, tuple)) and len(poly) >= 3:
-                    from PyQt5.QtGui import QPainterPath
-                    path = QPainterPath()
-                    for i, pt in enumerate(poly):
-                        try:
-                            px = int(pt[0] * s - off_x)
-                            py = int(pt[1] * s - off_y)
-                        except Exception:
-                            continue
-                        if i == 0:
-                            path.moveTo(px, py)
-                        else:
-                            path.lineTo(px, py)
-                    path.closeSubpath()
-                    painter.drawPath(path)
-                    drew_poly = True
+                cx = dx + dw // 2
+                cy = dy + dh // 2
+                radius = 18  # uniform size for all markers
+                state = d.get("defect_state")
+                fill = _color_for_state(state)
+                border = QColor(fill)
+                border.setAlpha(220)
+                painter.setBrush(QBrush(fill))
+                pen = QPen(border)
+                pen.setWidth(2)
+                painter.setPen(pen)
+                painter.drawEllipse(cx - radius, cy - radius, radius * 2, radius * 2)
 
-                if self._draw_boxes and not drew_poly:
-                    painter.drawRect(dx, dy, dw, dh)
-                    label = str(d.get("class", ""))
-                    score = d.get("score")
-                    if score is not None:
-                        try:
-                            label += f" {float(score):.2f}"
-                        except Exception:
-                            pass
-                    if label:
-                        # Draw label with background box for readability
-                        metrics = painter.fontMetrics()
-                        tw = metrics.width(label) + 6
-                        th = metrics.height() + 4
-                        bg = QColor(0, 200, 83, 180)
-                        painter.fillRect(dx, max(0, dy - th), tw, th, bg)
-                        painter.setPen(QColor(255, 255, 255))
-                        painter.drawText(dx + 3, dy - 4, label)
-                        painter.setPen(pen)
-
-                # Optional arrow overlay if provided
-                arr = d.get("arrow")
-                if isinstance(arr, dict):
-                    anc = arr.get("anchor")
-                    vec = arr.get("vec")
-                    if anc and vec:
-                        ax = int(anc[0] * s - off_x)
-                        ay = int(anc[1] * s - off_y)
-                        ex = int((anc[0] + vec[0]) * s - off_x)
-                        ey = int((anc[1] + vec[1]) * s - off_y)
-                        blue = QPen(QColor(0, 122, 204))
-                        blue.setWidth(2)
-                        painter.setPen(blue)
-                        # Arrow line
-                        painter.drawLine(ax, ay, ex, ey)
-                        # Simple arrow head
-                        import math
-                        ang = math.atan2(ey - ay, ex - ax)
-                        head_len = max(6, int(0.08 * (abs(ex - ax) + abs(ey - ay))))
-                        a1 = ang + math.radians(155)
-                        a2 = ang - math.radians(155)
-                        hx1 = ex + int(head_len * math.cos(a1))
-                        hy1 = ey + int(head_len * math.sin(a1))
-                        hx2 = ex + int(head_len * math.cos(a2))
-                        hy2 = ey + int(head_len * math.sin(a2))
-                        painter.drawLine(ex, ey, hx1, hy1)
-                        painter.drawLine(ex, ey, hx2, hy2)
-                        painter.setPen(pen)
-                        # Draw green index near the arrow base
-                        idx_val = d.get("index") if isinstance(d, dict) else None
-                        if idx_val is not None:
-                            green = QPen(QColor(0, 200, 0))
-                            painter.setPen(green)
-                            painter.drawText(ax + 4, ay - 6, str(idx_val))
-                            painter.setPen(pen)
-                        # Draw yellow phi value near arrow end if present
-                        phi = d.get("phi") if isinstance(d, dict) else None
-                        if isinstance(phi, (int, float)):
-                            ypen = QPen(QColor(255, 215, 0))
-                        painter.setPen(ypen)
-                        painter.drawText(ex + 6, ey, f"{phi:.3f}")
-                        painter.setPen(pen)
+                # Text: index centered
+                font = QFont()
+                font.setPointSize(10)
+                font.setBold(True)
+                painter.setFont(font)
+                idx_val = d.get("index")
+                label = str(idx_val) if idx_val is not None else ""
+                if label:
+                    metrics = painter.fontMetrics()
+                    tw = metrics.width(label)
+                    th = metrics.height()
+                    painter.setPen(QColor(0, 0, 0))
+                    painter.drawText(cx - tw // 2, cy + th // 4, label)
             except Exception:
                 continue
         # Optional tuned contour polyline
@@ -448,12 +368,32 @@ class ImagePreviewPanel(QWidget):
             composed = self._apply_attachment_overlay(base, composed, target_w, target_h)
         return composed
 
+    def capture_attachment_view_fullres(self):
+        """Capture annotated attachment view at native resolution (no cropping/letterboxing)."""
+        if self._original_base_pm is None:
+            return None
+        base = self._original_base_pm
+        composed = QPixmap(base)
+        if self._attachment_detections or (self._attachment_contour is not None):
+            composed = self._apply_attachment_overlay(base, composed, base.width(), base.height())
+        return composed
+
     def save_attachment_view(self, path: str) -> bool:
         pm = self.capture_attachment_view()
         if pm is None or pm.isNull():
             return False
         try:
             # Infer format from suffix; default to PNG
+            suffix = (path.rsplit('.', 1)[-1] or 'png').upper() if '.' in path else 'PNG'
+            return bool(pm.save(path, suffix))
+        except Exception:
+            return False
+
+    def save_attachment_view_fullres(self, path: str) -> bool:
+        pm = self.capture_attachment_view_fullres()
+        if pm is None or pm.isNull():
+            return False
+        try:
             suffix = (path.rsplit('.', 1)[-1] or 'png').upper() if '.' in path else 'PNG'
             return bool(pm.save(path, suffix))
         except Exception:
@@ -469,6 +409,26 @@ class ImagePreviewPanel(QWidget):
         if self._front_overlay_enabled:
             composed = self._apply_front_overlay(base, composed, target_w, target_h)
         return composed
+
+    def render_attachment_overlay(self, base_pixmap: QPixmap, detections, contour=None):
+        """
+        Render an annotated attachment view using the provided base pixmap and detections
+        without mutating the UI state or labels.
+        """
+        if base_pixmap is None or base_pixmap.isNull():
+            return None
+        prev_det = self._attachment_detections
+        prev_cnt = self._attachment_contour
+        try:
+            self._attachment_detections = detections or []
+            if contour is not None:
+                self._attachment_contour = contour
+            return self._apply_attachment_overlay(base_pixmap, base_pixmap, base_pixmap.width(), base_pixmap.height())
+        except Exception:
+            return None
+        finally:
+            self._attachment_detections = prev_det
+            self._attachment_contour = prev_cnt
 
     def save_front_view(self, path: str) -> bool:
         pm = self.capture_front_view()

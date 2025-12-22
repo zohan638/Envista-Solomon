@@ -8,6 +8,7 @@ from PyQt5.QtWidgets import (
     QFileDialog,
     QMessageBox,
 )
+from PyQt5.QtGui import QPixmap
 
 from .workflow_tab import WorkflowTab
 from .logic_tab import LogicTab
@@ -29,8 +30,10 @@ import time
 import cv2
 
 # Horizontal FOV of the front camera when measured inside the top-camera image (pixels)
-DEFAULT_FRONT_FOV_TOP_PX = 951.0
-
+DEFAULT_FRONT_FOV_TOP_PX = 441.4
+# Front-view calibration: 1450 actuator steps corresponds to 1270 px in the front image.
+FRONT_STEPS_PER_PIXEL = 1450.0 / 1270.0
+FRONT_IMAGE_WIDTH_PX = 2464.0
 
 class _AxisUiBridge(QObject):
     set_ready = pyqtSignal(bool)
@@ -49,6 +52,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Detectron Demo")
         self.resize(1184, 661)
         self._current_image_path = None
+        self._last_top_detections = []
+        self._attachment_defect_state = {}
+        self._top_raw_np = None
 
         # Root splitter (left: workflow tabs, right: previews + ledger)
         root_splitter = QSplitter(Qt.Horizontal)
@@ -70,15 +76,14 @@ class MainWindow(QMainWindow):
 
         self.preview_panel = ImagePreviewPanel()
         right_layout.addWidget(self.preview_panel)
-        try:
-            st = state()
-            if st.overlay_enabled is not None:
-                self.preview_panel.chk_overlay.setChecked(bool(st.overlay_enabled))
-        except Exception:
-            pass
 
         self.defect_ledger = DefectLedger()
         right_layout.addWidget(self.defect_ledger)
+        try:
+            self.defect_ledger.prev_requested.connect(self.on_prev)
+            self.defect_ledger.next_requested.connect(self.on_next)
+        except Exception:
+            pass
 
         root_splitter.addWidget(right_container)
         root_splitter.setStretchFactor(0, 38)
@@ -104,11 +109,6 @@ class MainWindow(QMainWindow):
             self.workflow_tab.defect_threshold_changed.connect(self.on_defect_threshold_changed)
         except Exception:
             pass
-        
-
-        self.preview_panel.overlay_toggled.connect(self.on_overlay_toggled)
-        self.preview_panel.prev_requested.connect(self.on_prev)
-        self.preview_panel.next_requested.connect(self.on_next)
 
         # Camera panel signals
         cam = self.workflow_tab.camera_panel
@@ -174,6 +174,17 @@ class MainWindow(QMainWindow):
         self._axis_ui.set_position.connect(lambda p: ax.set_position(p))
         # Initial axis ports
         self.on_axis_refresh()
+        # Seed linear axis home button with persisted value (even if PLC was already connected via the wizard).
+        try:
+            st = state()
+            hs = getattr(st, "linear_axis_home_steps", None)
+            if hs is None:
+                hs = getattr(st, "linear_axis_last_steps", None)
+            if hs is None:
+                hs = 0
+            self.workflow_tab.linear_axis_panel.set_home_steps(int(hs))
+        except Exception:
+            pass
 
         # Reflect existing connections from wizard
         try:
@@ -226,6 +237,69 @@ class MainWindow(QMainWindow):
                 self.preview_panel.set_front_np(pm)
         except Exception:
             pass
+
+    # ----- Attachment overlay bookkeeping -----
+    def _set_top_detections(self, dets):
+        try:
+            self._last_top_detections = [dict(d) for d in (dets or [])]
+        except Exception:
+            self._last_top_detections = list(dets or [])
+        self._update_top_annotation()
+
+    def _apply_defect_states_to_overlay(self):
+        try:
+            dets = []
+            for d in self._last_top_detections:
+                try:
+                    nd = dict(d)
+                except Exception:
+                    nd = d
+                try:
+                    idx_val = int(nd.get("index", None))
+                except Exception:
+                    idx_val = nd.get("index")
+                st = self._attachment_defect_state.get(idx_val)
+                if st is not None:
+                    nd["defect_state"] = st
+                dets.append(nd)
+            base_pm = None
+            try:
+                if self._top_raw_np is not None:
+                    base_pm = np_bgr_to_qpixmap(self._top_raw_np)
+            except Exception:
+                base_pm = None
+            composed = None
+            if base_pm is not None:
+                composed = self.preview_panel.render_attachment_overlay(base_pm, dets)
+            if composed is not None and (not composed.isNull()):
+                self.defect_ledger.set_top_pixmap(composed)
+        except Exception:
+            pass
+
+    def _update_top_annotation(self):
+        try:
+            if self._top_raw_np is None:
+                try:
+                    import os as _os
+                    if getattr(self, "_last_capture_path", None) and _os.path.exists(self._last_capture_path):
+                        self._top_raw_np = cv2.imread(self._last_capture_path)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._apply_defect_states_to_overlay()
+
+    def _set_defect_state(self, idx, state: str):
+        try:
+            key = int(idx)
+        except Exception:
+            key = idx
+        self._attachment_defect_state[key] = state
+        try:
+            from PyQt5.QtCore import QTimer as _QTimer
+            _QTimer.singleShot(0, self._update_top_annotation)
+        except Exception:
+            self._update_top_annotation()
 
     def _on_live_frame_ready(self, role: str, gen: int, frame):
         if self._live_closed or not self._live_enabled:
@@ -312,6 +386,19 @@ class MainWindow(QMainWindow):
             self._stop_live_feed()
         except Exception:
             pass
+        # Reset per-run attachment status and latest raw
+        try:
+            self._attachment_defect_state = {}
+            self._top_raw_np = None
+            self._set_top_detections([])
+        except Exception:
+            pass
+        # Restart live feed after this handler completes so previews resume automatically.
+        try:
+            from PyQt5.QtCore import QTimer as _QTimer
+            _QTimer.singleShot(0, self._start_live_feed)
+        except Exception:
+            pass
         # Prepare capture directory structure based on date/time
         from datetime import datetime
         import re
@@ -378,6 +465,11 @@ class MainWindow(QMainWindow):
                 # update preview immediately
                 pm = np_bgr_to_qpixmap(frame)
                 self.preview_panel.set_original_np(pm)
+                try:
+                    import numpy as _np
+                    self._top_raw_np = _np.array(frame).copy()
+                except Exception:
+                    self._top_raw_np = None
                 # Save raw capture into captures folder
                 if cap_dir is not None:
                     try:
@@ -408,6 +500,12 @@ class MainWindow(QMainWindow):
                             img_path = dst
                     except Exception:
                         pass
+                # If using a file, also keep it as the raw baseline for annotations
+                try:
+                    if img_path and os.path.exists(img_path):
+                        self._top_raw_np = cv2.imread(img_path)
+                except Exception:
+                    pass
         except Exception as ex:
             capture_error = str(ex)
             self.workflow_tab.append_log(f"[Camera] Capture failed: {capture_error}")
@@ -535,17 +633,33 @@ class MainWindow(QMainWindow):
                         pass
             except Exception:
                 pass
-            self.defect_ledger.populate_ledger(results)
             self.workflow_tab.append_log(f"[Detectron] {len(results)} detection(s)")
             try:
                 # Arrows computed above; overlay arrows only
-                self.preview_panel.set_draw_boxes(False)
-                self.preview_panel.set_attachment_detections(results)
+                self._set_top_detections(results)
+                # Capture annotated top view for the ledger
+                try:
+                    if self._top_raw_np is not None:
+                        try:
+                            pm_base = np_bgr_to_qpixmap(self._top_raw_np)
+                            self.preview_panel.set_original_np(pm_base)
+                        except Exception:
+                            pass
+                    self._apply_defect_states_to_overlay()
+                    ann_pm = self.preview_panel.capture_attachment_view_fullres()
+                    if ann_pm is not None and (not ann_pm.isNull()):
+                        try:
+                            from PyQt5.QtCore import QTimer as _QTimer
+                            _QTimer.singleShot(0, lambda pm=ann_pm: self.defect_ledger.set_top_pixmap(pm))
+                        except Exception:
+                            self.defect_ledger.set_top_pixmap(ann_pm)
+                except Exception:
+                    pass
                 # Save annotated view if capture dir is available
                 if cap_dir is not None:
                     try:
                         out_path = str((cap_dir / 'step-01_top_annotated.png'))
-                        if self.preview_panel.save_attachment_view(out_path):
+                        if self.preview_panel.save_attachment_view_fullres(out_path):
                             self.workflow_tab.append_log(f"[Capture] Saved annotated: {out_path}")
                     except Exception:
                         pass
@@ -643,6 +757,11 @@ class MainWindow(QMainWindow):
                         self._run_step2_sequence(results, cap_dir)
                     except Exception as ex:
                         self.workflow_tab.append_log(f"[Step2] Failed to start: {ex}")
+            except Exception:
+                pass
+            # Clear overlay state so live feed is not stuck with detections
+            try:
+                self.preview_panel.set_draw_boxes(True)
             except Exception:
                 pass
         except Exception as ex:
@@ -834,18 +953,12 @@ class MainWindow(QMainWindow):
                     except Exception:
                         pass
                 # Update preview overlay only
-                self.preview_panel.set_draw_boxes(False)
-                self.preview_panel.set_attachment_detections(results)
+                self._set_top_detections(results)
                 self.workflow_tab.append_log("[Tuner] Applied contour params to overlay.")
             except Exception as ex:
                 QMessageBox.information(self, "Tuner", f"Preview apply failed: {ex}")
 
     # Blob tuner and backend switching removed
-
-    def on_overlay_toggled(self, checked: bool):
-        self.preview_panel.set_overlay_enabled(checked)
-        self.workflow_tab.append_log(f"Overlay toggled: {'ON' if checked else 'OFF'}")
-        st = state(); st.overlay_enabled = bool(checked); save_state()
 
     def on_prev(self):
         # Placeholder: gallery navigation not implemented
@@ -1001,12 +1114,16 @@ class MainWindow(QMainWindow):
             # Snapshot helper (post to UI thread)
             def _show_front(frame):
                 try:
-                    QTimer.singleShot(0, lambda f=frame: self.preview_panel.set_front_np(np_bgr_to_qpixmap(f)))
+                    pm = frame if isinstance(frame, QPixmap) else np_bgr_to_qpixmap(frame)
+                    from PyQt5.QtCore import QTimer as _QTimer
+                    _QTimer.singleShot(0, lambda f=pm: self.defect_ledger.set_front_pixmap(f))
                 except Exception:
                     pass
             def _show_top(frame):
                 try:
-                    QTimer.singleShot(0, lambda f=frame: self.preview_panel.set_original_np(np_bgr_to_qpixmap(f)))
+                    pm = frame if isinstance(frame, QPixmap) else np_bgr_to_qpixmap(frame)
+                    from PyQt5.QtCore import QTimer as _QTimer
+                    _QTimer.singleShot(0, lambda f=pm: self.defect_ledger.set_top_pixmap(f))
                 except Exception:
                     pass
 
@@ -1043,11 +1160,8 @@ class MainWindow(QMainWindow):
                         except (TypeError, ValueError):
                             top_fov_val = 0.0
                         if abs(top_fov_val) > 1e-3:
-                            PIXELS_PER_MM = 72.3035714
-                            FRONT_WIDTH_PX = 2592.0
-                            delta_px = (off_top / top_fov_val) * FRONT_WIDTH_PX
-                            delta_mm = delta_px / PIXELS_PER_MM
-                            # Convert mm offset into actuator steps using the calibrated total step range.
+                            delta_px = (off_top / top_fov_val) * FRONT_IMAGE_WIDTH_PX
+                            # Convert pixel offset into actuator steps using calibrated pixel-to-step factor.
                             try:
                                 cfg = _state()
                                 home_steps = getattr(cfg, "linear_axis_home_steps", None)
@@ -1055,7 +1169,7 @@ class MainWindow(QMainWindow):
                                     home_steps = int(total_steps) // 2
                             except Exception:
                                 home_steps = int(total_steps) // 2
-                            delta_steps = int(round((float(delta_mm) / 100.0) * float(total_steps)))
+                            delta_steps = int(round(float(delta_px) * float(FRONT_STEPS_PER_PIXEL)))
                             tgt_steps = int(home_steps) + int(delta_steps)
                             target_steps = max(0, min(int(total_steps), int(tgt_steps)))
                         else:
@@ -1150,6 +1264,12 @@ class MainWindow(QMainWindow):
                     elif ax_res["msg"]:
                         self.tt_message.emit(ax_res["msg"])
 
+                # Small dwell to allow motion to fully settle before imaging
+                try:
+                    time.sleep(0.1)
+                except Exception:
+                    pass
+
                 # Capture from cameras if available and update previews
                 try:
                     top_snapshot = None
@@ -1232,9 +1352,7 @@ class MainWindow(QMainWindow):
                             self.tt_message.emit(f"[Step2] Detection missing center; discarding idx {idx}.")
                             continue
                         dx_px = dcx - cx_crop  # + => bbox to the right of center
-                        # Convert pixel offset to actuator steps using front camera scale and calibration total steps.
-                        PIXELS_PER_MM = 66.3035714
-                        dx_mm = float(dx_px) / float(PIXELS_PER_MM)
+                        # Convert pixel offset to actuator steps using front camera scale.
                         try:
                             total_steps = linear_axis_service.calibration_total_steps()
                         except Exception:
@@ -1256,7 +1374,7 @@ class MainWindow(QMainWindow):
                             if curr_steps is None:
                                 curr_steps = int(total_steps) // 2
 
-                            dx_steps = int(round((dx_mm / 100.0) * float(total_steps)))
+                            dx_steps = int(round(float(dx_px) * float(FRONT_STEPS_PER_PIXEL)))
                             # Flip sign: bbox right of center -> move actuator left (negative delta)
                             new_target = max(0, min(int(total_steps), int(curr_steps) - int(dx_steps)))
                             tol_steps = max(1, int(round((0.05 / 100.0) * float(total_steps))))
@@ -1268,15 +1386,20 @@ class MainWindow(QMainWindow):
                                         self.tt_message.emit(f"[Step2] Correction move failed: {corr_res['err']}")
                                     elif corr_res["msg"]:
                                         self.tt_message.emit(
-                                            f"{corr_res['msg']} (correction dx={dx_px:.2f}px -> {dx_mm:.3f}mm -> {dx_steps} steps, new={new_target} steps)"
+                                            f"{corr_res['msg']} (correction dx={dx_px:.2f}px -> {dx_steps} steps, new={new_target} steps)"
                                         )
                                 except Exception as ex:
                                     self.tt_message.emit(f"[Step2] Correction move failed: {ex}")
                             else:
                                 self.tt_message.emit(
-                                    f"[Step2] Alignment within tolerance (dx={dx_px:.2f}px -> {dx_mm:.3f}mm -> {dx_steps} steps); no correction move."
+                                    f"[Step2] Alignment within tolerance (dx={dx_px:.2f}px -> {dx_steps} steps); no correction move."
                                 )
 
+                        # Capture corrected frame after a short settle to avoid motion blur
+                        try:
+                            time.sleep(0.1)
+                        except Exception:
+                            pass
                         # Capture corrected frame
                         overlay = _capture_front()
                         corrected_raw_path = None
@@ -1296,16 +1419,10 @@ class MainWindow(QMainWindow):
                         except Exception:
                             pass
 
-                        # Update front preview
+                        # Send front snapshot to the ledger (leave live preview untouched)
                         try:
                             pm_front = np_bgr_to_qpixmap(overlay)
                             _show_front(pm_front)
-                            try:
-                                from PyQt5.QtCore import QTimer as _QTimer
-                                _QTimer.singleShot(0, lambda x=x_mark: self.preview_panel.set_front_markers([x]))
-                            except Exception:
-                                pass
-                            QTimer.singleShot(0, lambda det=[]: self.preview_panel.set_front_detections(det))
                         except Exception:
                             pass
 
@@ -1585,6 +1702,17 @@ class MainWindow(QMainWindow):
                     self.workflow_tab.linear_axis_panel.set_ready(connected)
                 except Exception:
                     pass
+                if connected:
+                    try:
+                        cfg = state()
+                        hs = getattr(cfg, "linear_axis_home_steps", None)
+                        if hs is None:
+                            hs = getattr(cfg, "linear_axis_last_steps", None)
+                        if hs is None:
+                            hs = 0
+                        self.workflow_tab.linear_axis_panel.set_home_steps(int(hs))
+                    except Exception:
+                        pass
                 if not connected:
                     err = getattr(snap, "last_error", None) or "PLC disconnected."
                     try:
@@ -2070,10 +2198,12 @@ class MainWindow(QMainWindow):
                 dets = []
 
             ann = img.copy()
+            state = "ok"
             if not dets:
                 # No detections; still use palette color instead of red
                 _cv2.putText(ann, 'No defects', (20, 40), _cv2.FONT_HERSHEY_SIMPLEX, 1.0, palette_fallback, 2)
             else:
+                state = "fail"
                 for det in dets:
                     b = det.get('bounds')
                     if not b or len(b) < 4:
@@ -2086,12 +2216,12 @@ class MainWindow(QMainWindow):
                         continue
                     try:
                         cid = det.get("class_id")
-                        idx = int(cid) if cid is not None else 0
+                        cid_idx = int(cid) if cid is not None else 0
                     except Exception:
-                        idx = 0
-                    if idx < 0 or idx >= len(palette_bgr):
-                        idx = 0
-                    color = palette_bgr[idx] if palette_bgr else palette_fallback
+                        cid_idx = 0
+                    if cid_idx < 0 or cid_idx >= len(palette_bgr):
+                        cid_idx = 0
+                    color = palette_bgr[cid_idx] if palette_bgr else palette_fallback
                     _cv2.rectangle(ann, (x, y), (x + w, y + h), color, 2)
                     label = str(det.get('class') or 'defect')
                     try:
@@ -2106,6 +2236,10 @@ class MainWindow(QMainWindow):
             out_ann = str(step4_dir / f"step-04_defect_{idx:03d}.png")
             _cv2.imwrite(out_ann, ann)
             self.tt_message.emit(f"[Step4] idx {idx}: saved {out_ann}")
+            try:
+                self._set_defect_state(idx, state)
+            except Exception:
+                pass
         except Exception as ex:
             try:
                 self.tt_message.emit(f"[Step4] idx {idx}: failed: {ex}")

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import contextlib
 import os
 import re
 import socket
@@ -372,9 +373,10 @@ def _ensure_harvester() -> Optional[Any]:
 
     _configure_runtime_paths(gentl_file)
     try:
-        h = Harvester()
-        h.add_file(str(gentl_file))
-        h.update()
+        with open(os.devnull, "w") as _devnull, contextlib.redirect_stdout(_devnull), contextlib.redirect_stderr(_devnull):
+            h = Harvester()
+            h.add_file(str(gentl_file))
+            h.update()
         _HARVESTER = h
         _diag["last_error"] = None
         _diag["last_update_s"] = time.time()
@@ -407,7 +409,8 @@ def _rebuild_device_table(max_devices: int = 8) -> None:
     # device list when no cameras are currently connected.
     if not _has_active_connections():
         try:
-            h.update()
+            with open(os.devnull, "w") as _devnull, contextlib.redirect_stdout(_devnull), contextlib.redirect_stderr(_devnull):
+                h.update()
             _diag["last_update_s"] = time.time()
         except Exception as ex:
             _diag["last_error"] = str(ex)

@@ -642,11 +642,11 @@ For each detection from Step 1 (in CCW order):
 #### FOV Calibration
 The system uses pre-calibrated field-of-view values for front camera alignment:
 - `FRONT_FOV_TOP_PX = 951` - Width of front camera view in top image (pixels)
-- `PIXELS_PER_MM = 72.3` - Conversion factor for linear axis
+- `FRONT_STEPS_PER_PIXEL ≈ 1.14` - Conversion factor for linear axis (1450 steps moves 1270 px in front view)
 - **To recalibrate**:
   1. Place calibration target
   2. Measure front camera FOV in top image
-  3. Update `state.front_fov_top_px` in code or config
+  3. Update `state.front_fov_top_px` and `FRONT_STEPS_PER_PIXEL` in code or config
 
 #### Parallel Processing
 - Steps 3 & 4 run in background ThreadPoolExecutor
