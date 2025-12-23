@@ -1017,76 +1017,68 @@ gh release create v1.0.0 dist/EnvistaSolomon.zip \
 
 ```
 Envista-Solomon/
-├── main.py                      # Application entry point
-├── requirements.txt             # Python dependencies
-├── user_settings.json          # Persistent configuration (auto-generated)
-├── crash.log                   # Error log (auto-generated)
-├── MV GigE V/                   # GenTL producer bundle (MVProducerGEV.cti)
-│
-├── services/                   # Backend services
-│   ├── __init__.py
-│   ├── app_paths.py           # Path utilities
-│   ├── camera_manager.py      # Unified camera + light interface
-│   ├── camera_service.py      # Camera enumeration & capture (Harvester/GenTL)
-│   ├── config.py              # Settings dataclasses
-│   ├── contour_tools.py       # Edge detection & arrow computation
-│   ├── crash_reporter.py      # Exception logging
-│   ├── light_controller.py    # ULC-2 LED controller
-│   ├── linear_axis_service.py # Linear stage control
-│   ├── project_loader.py      # Model loading wrapper
-│   ├── solvision_manager.py   # Detectron2 inference engine
-│   └── turntable_service.py   # Rotary stage control
-│
-├── ui/                         # PyQt5 UI components
-│   ├── __init__.py
-│   ├── camera_panel.py        # Camera selection widget
-│   ├── defect_ledger.py       # Defect results table
-│   ├── edge_tuner.py          # Contour parameter tuning dialog
-│   ├── image_preview_panel.py # Dual-pane image viewer
-│   ├── init_wizard.py         # Setup wizard
-│   ├── linear_axis_panel.py   # Linear axis controls
-│   ├── loading_dialog.py      # Progress dialog
-│   ├── logic_tab.py           # Logic tab (placeholder)
-│   ├── main_window.py         # Main application window
-│   ├── qt_image.py            # NumPy/Qt image conversion
-│   ├── turntable_panel.py     # Turntable controls
-│   └── workflow_tab.py        # Primary workflow interface
-│
-├── scripts/                    # Build & utility scripts
-│   └── build_exe.ps1          # PyInstaller build script
-│
-├── data_extractor.py           # Capture flattening utility
-├── live_blob_tool.py           # Interactive blob detection tuner
-├── tmp_import_check.py         # Dependency validation
-│
-├── captures/                   # Output directory (auto-generated)
-│   └── <PartID>/
-│       └── <YYYY-MM-DD>/
-│           └── <HHMMSS>/
-│               ├── step-01_*.png
-│               ├── step-02/
-│               ├── step-03/
-│               ├── step-04/
-│               └── cycle_time.txt
-│
-├── captures_extracted/         # Flattened outputs (from data_extractor.py)
-│
-├── .github/                    # GitHub Actions workflows
-│   └── workflows/
-│       └── build-release-exe.yml
-│
-└── README.md                   # This file
+??? main.py                      # Application entry point
+??? requirements.txt             # Python dependencies
+??? user_settings.json           # Persistent configuration (auto-generated)
+??? crash.log                    # Error log (auto-generated)
+??? MV GigE V/                   # GenTL producer bundle (MVProducerGEV.cti)
+??? controllers/                 # MVC controllers (orchestration layer)
+?   ??? app_controller.py        # Boots wizard + main window with shared controllers
+?   ??? hardware_controller.py   # PLC/turntable/axis orchestration
+?   ??? live_camera_controller.py# Live capture + device lifecycle
+?   ??? model_controller.py      # Detectron model loading/guards
+?   ??? workflow_controller.py   # Four-step inspection workflow logic
+??? models/                      # Lightweight domain models
+?   ??? run_context.py           # Capture run metadata
+??? services/                    # Backend services (model layer)
+?   ??? __init__.py
+?   ??? app_paths.py
+?   ??? camera_manager.py
+?   ??? camera_service.py
+?   ??? config.py
+?   ??? contour_tools.py
+?   ??? crash_reporter.py
+?   ??? light_controller.py
+?   ??? linear_axis_service.py
+?   ??? project_loader.py
+?   ??? solvision_manager.py
+?   ??? turntable_service.py
+??? ui/                          # PyQt5 views (pure presentation)
+?   ??? __init__.py
+?   ??? camera_panel.py
+?   ??? defect_ledger.py
+?   ??? edge_tuner.py
+?   ??? image_preview_panel.py
+?   ??? init_wizard.py
+?   ??? linear_axis_panel.py
+?   ??? loading_dialog.py
+?   ??? logic_tab.py
+?   ??? main_window.py
+?   ??? qt_image.py
+?   ??? turntable_panel.py
+?   ??? workflow_tab.py
+??? scripts/                     # Build & utility scripts
+?   ??? build_exe.ps1
 ```
+
+**MVC layout**
+- **Models**: `services/` (hardware, AI, persistence) and `models/` for lightweight dataclasses.
+- **Views**: `ui/` widgets/dialogs that render state without business logic.
+- **Controllers**: `controllers/` orchestrate workflows, live capture, hardware, and model loading, wiring signals between models and views.
 
 ### Key Files
 
 | File | Purpose |
 |------|---------|
 | `main.py` | Bootstraps Detectron2, installs crash reporter, launches Qt app |
+| `controllers/app_controller.py` | Spins up shared controllers, wizard, and main window |
+| `controllers/workflow_controller.py` | Four-step inspection orchestration (detect, rotate, align, defect) |
+| `controllers/live_camera_controller.py` | Live camera lifecycle + frame scheduling |
+| `controllers/hardware_controller.py` | PLC/turntable/axis coordination and status relays |
 | `services/solvision_manager.py` | Detectron2 model loading, inference, result normalization |
 | `services/camera_manager.py` | High-level camera + lighting control |
 | `services/contour_tools.py` | Arrow computation, CCW indexing, edge detection |
-| `ui/main_window.py` | 4-step detection orchestration, hardware coordination |
+| `ui/main_window.py` | Main view wiring controllers to workflow/preview/ledger |
 | `ui/workflow_tab.py` | User controls, settings, log display |
 | `ui/image_preview_panel.py` | Overlay rendering (arrows, boxes, contours) |
 | `data_extractor.py` | Training data preparation |

@@ -1,4 +1,4 @@
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSignal, QEvent
 from PyQt5.QtGui import QPixmap, QPainter, QColor, QPen
 from PyQt5.QtWidgets import (
     QWidget,
@@ -10,6 +10,8 @@ from PyQt5.QtWidgets import (
 
 
 class ImagePreviewPanel(QWidget):
+    attachment_clicked = pyqtSignal(object)  # index clicked on the top overlay
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -25,7 +27,7 @@ class ImagePreviewPanel(QWidget):
         self.group_attachment = QGroupBox("3. Attachment Overview")
         left_v = QVBoxLayout(self.group_attachment)
         self.original_label = QLabel()
-        self.original_label.setStyleSheet("background: black;")
+        self.original_label.setStyleSheet("background: black; color: white;")
         self.original_label.setAlignment(Qt.AlignCenter)
         self.original_label.setMinimumSize(200, 150)
         self.original_label.setScaledContents(False)
@@ -37,7 +39,7 @@ class ImagePreviewPanel(QWidget):
         right_v = QVBoxLayout(self.group_front)
 
         self.front_label = QLabel()
-        self.front_label.setStyleSheet("background: black;")
+        self.front_label.setStyleSheet("background: black; color: white;")
         self.front_label.setAlignment(Qt.AlignCenter)
         self.front_label.setMinimumSize(200, 150)
         self.front_label.setScaledContents(False)
@@ -56,6 +58,7 @@ class ImagePreviewPanel(QWidget):
         self._front_detections = []       # list of dicts for front view
         self._front_markers = []          # list of x positions (original pixel coords)
         self._draw_boxes = True
+        self.original_label.installEventFilter(self)
 
     # Public helpers
     def _apply_scaled_cover(self, label: QLabel, pm: QPixmap):
@@ -221,7 +224,7 @@ class ImagePreviewPanel(QWidget):
 
         def _color_for_state(state: str) -> QColor:
             st = (state or "").lower()
-            if st == "fail":
+            if st in {"fail", "defect"}:
                 return QColor(220, 20, 60, 150)  # red, semi-transparent
             if st == "ok":
                 return QColor(46, 125, 50, 140)  # green, semi-transparent
@@ -299,6 +302,63 @@ class ImagePreviewPanel(QWidget):
             pass
         painter.end()
         return result
+
+    def _map_label_to_original(self, label: QLabel, pos):
+        """Map a click position in label coords to original image coords."""
+        if self._original_base_pm is None or self._original_base_pm.isNull():
+            return None, None
+        bw, bh = self._original_base_pm.width(), self._original_base_pm.height()
+        if bw <= 0 or bh <= 0:
+            return None, None
+        target_w = max(1, label.width())
+        target_h = max(1, label.height())
+        sx = target_w / bw
+        sy = target_h / bh
+        s = max(sx, sy)
+        scaled_w = bw * s
+        scaled_h = bh * s
+        off_x = max(0, (scaled_w - target_w) / 2.0)
+        off_y = max(0, (scaled_h - target_h) / 2.0)
+        x_orig = (pos.x() + off_x) / s
+        y_orig = (pos.y() + off_y) / s
+        return x_orig, y_orig
+
+    def _emit_attachment_click(self, x_orig, y_orig):
+        if not self._attachment_detections:
+            return
+        best_idx = None
+        best_dist2 = None
+        for d in self._attachment_detections:
+            try:
+                idx = d.get("index")
+                b = d.get("bounds")
+                if not b or idx is None:
+                    continue
+                cx = b[0] + b[2] / 2.0
+                cy = b[1] + b[3] / 2.0
+                dx = cx - x_orig
+                dy = cy - y_orig
+                dist2 = dx * dx + dy * dy
+                if best_dist2 is None or dist2 < best_dist2:
+                    best_dist2 = dist2
+                    best_idx = idx
+            except Exception:
+                continue
+        try:
+            if best_idx is not None:
+                # Require a reasonable proximity (~60 px in original coords)
+                if best_dist2 is None or best_dist2 <= (60 * 60):
+                    self.attachment_clicked.emit(best_idx)
+        except Exception:
+            pass
+
+    def eventFilter(self, obj, event):
+        if obj == self.original_label and event.type() == QEvent.MouseButtonPress:
+            x, y = self._map_label_to_original(self.original_label, event.pos())
+            if x is not None and y is not None:
+                self._emit_attachment_click(x, y)
+            return False
+        return super().eventFilter(obj, event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

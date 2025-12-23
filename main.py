@@ -24,17 +24,14 @@ def main():
         return 1
 
     from PyQt5.QtWidgets import QApplication
-    from ui.main_window import MainWindow
-    from ui.init_wizard import InitWizard
+    from controllers.app_controller import AppController
 
     app = QApplication(sys.argv)
-    # Show initialization wizard first
-    init = InitWizard()
-    if init.exec_() != init.Accepted:
+    controller = AppController()
+    window = controller.launch()
+    if window is None:
         solvision_manager.dispose()
         return 0
-    window = MainWindow()
-    window.show()
     rc = app.exec_()
     solvision_manager.dispose()
     return rc

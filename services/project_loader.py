@@ -8,5 +8,8 @@ def load_project(path: str):
         raise RuntimeError(solvision_manager.initialization_error() or "Model initialization failed")
     solvision_manager.load_project(path)
     # Persist last project path
-    st = state(); st.last_project_path = path; save_state()
+    st = state()
+    st.last_project_path = path
+    st.attachment_path = path
+    save_state()
     return {"path": path}

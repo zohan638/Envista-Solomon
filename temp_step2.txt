@@ -1,0 +1,800 @@
+        if ok:
+            self.workflow_tab.turntable_panel.set_connected(True, turntable_service.port_name() or port)
+            # PLC drives both turntable and linear axis; reflect connection on axis panel too.
+            try:
+                self.workflow_tab.linear_axis_panel.set_connected(True, linear_axis_service.port_name() or port)
+                self.workflow_tab.linear_axis_panel.set_ready(True)
+            except Exception:
+                pass
+            self.workflow_tab.append_log(f"[PLC] Connected to {turntable_service.port_name() or port}.")
+            st = state(); st.plc_host = str(port).split(":", 1)[0].strip() or str(port).strip(); st.turntable_step = float(self.workflow_tab.turntable_panel.step.value()); save_state()
+        else:
+            self.workflow_tab.append_log(f"[PLC] Connection failed for {port}: {plc_service.last_error() or ''}".strip())
+
+    def on_turntable_home(self):
+        # Run homing in a background thread to avoid blocking UI
+        import threading
+
+        def run():
+            res = turntable_service.home()
+            self.tt_message.emit(res.message)
+            status = res.message if res.success else f"Error: {res.message}"
+            self.tt_status.emit(status)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    # ---- Step 2 pipeline: rotate per phi and capture front images ----
+    def _run_step2_sequence(self, detections, cap_dir):
+        import threading, os, time
+        from pathlib import Path
+        import math
+        from services import turntable_service
+        from services import camera_service
+        from .qt_image import np_bgr_to_qpixmap
+        from PyQt5.QtCore import QTimer
+
+        # Prepare folder
+        step2_dir = Path(cap_dir) / 'step-02'
+        try:
+            step2_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        step3_dir = step2_dir.parent / 'step-03'
+        step4_dir = step2_dir.parent / 'step-04'
+        for _d in (step3_dir, step4_dir):
+            try:
+                _d.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+
+        # Order by index
+        ordered = []
+        try:
+            ordered = sorted([d for d in detections if isinstance(d, dict)], key=lambda d: int(d.get('index', 0)))
+        except Exception:
+            ordered = list(detections)
+
+        def worker():
+            try:
+                cycle_start = float(getattr(self, "_cycle_start_ts", None) or time.time())
+            except Exception:
+                cycle_start = time.time()
+            # Check turntable
+            if not turntable_service.is_connected():
+                self.tt_message.emit("[Step2] Turntable not connected; skipping rotation sequence.")
+                return
+            # Require models to be explicitly loaded by the user
+            front_model = solvision_manager.current_project_path_for('front')
+            defect_model = solvision_manager.current_project_path_for('defect')
+            try:
+                from services.config import state as _state
+                st_def = _state()
+                self._defect_thr_cached = getattr(st_def, "defect_score_threshold", None)
+            except Exception:
+                self._defect_thr_cached = None
+            if not front_model:
+                self.tt_message.emit("[Step2] Front model not loaded; skipping rotation/front alignment.")
+                return
+
+            # Background executor to overlap step-03/04 with motions (single worker to keep Detectron safe)
+            exec_bg = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            bg_futures = []
+
+            def _submit_step4(bbox_path, idx):
+                if not bbox_path or not defect_model:
+                    return
+                try:
+                    f = exec_bg.submit(
+                        self._process_step4_single,
+                        bbox_path,
+                        idx,
+                        step4_dir,
+                        defect_model,
+                        self._defect_thr_cached,
+                    )
+                    bg_futures.append(f)
+                except Exception as ex:
+                    try:
+                        self.tt_message.emit(f"[Step4] idx {idx}: submit failed: {ex}")
+                    except Exception:
+                        pass
+
+            def _submit_step3(crop_path, idx):
+                if not crop_path or not front_model:
+                    return
+                try:
+                    f = exec_bg.submit(self._process_step3_single, crop_path, idx, step3_dir, front_model)
+                    bg_futures.append(f)
+                except Exception as ex:
+                    try:
+                        self.tt_message.emit(f"[Step3] idx {idx}: submit failed: {ex}")
+                    except Exception:
+                        pass
+                    return
+
+                def _on_done(fut, _idx=idx):
+                    try:
+                        bbox_path = None
+                        try:
+                            bbox_path = fut.result()
+                        except Exception as inner_ex:
+                            try:
+                                self.tt_message.emit(f"[Step3] idx {_idx}: failed: {inner_ex}")
+                            except Exception:
+                                pass
+                            return
+                        _submit_step4(bbox_path, _idx)
+                    except Exception:
+                        pass
+
+                try:
+                    f.add_done_callback(_on_done)
+                except Exception:
+                    pass
+            # Snapshot helper (post to UI thread)
+            def _show_front(frame):
+                try:
+                    pm = frame if isinstance(frame, QPixmap) else np_bgr_to_qpixmap(frame)
+                    from PyQt5.QtCore import QTimer as _QTimer
+                    _QTimer.singleShot(0, lambda f=pm: self.defect_ledger.set_front_pixmap(f))
+                except Exception:
+                    pass
+            def _show_top(frame):
+                try:
+                    pm = frame if isinstance(frame, QPixmap) else np_bgr_to_qpixmap(frame)
+                    from PyQt5.QtCore import QTimer as _QTimer
+                    _QTimer.singleShot(0, lambda f=pm: self.defect_ledger.set_top_pixmap(f))
+                except Exception:
+                    pass
+
+            # Move sequentially by index, but turntable and axis move simultaneously per index.
+            last_phi = 0.0
+            for d in ordered:
+                phi = d.get('phi')
+                idx = int(d.get('index', 0) or 0)
+                if not isinstance(phi, (int, float)):
+                    self.tt_message.emit(f"[Step2] Skipping index {idx}: missing phi.")
+                    continue
+
+                # Compute turntable delta (deg) and desired actuator target (steps) for this detection.
+                move_deg = math.degrees(phi - last_phi)
+                last_phi = phi
+
+                target_steps = None
+                axis_reason = None
+                try:
+                    if linear_axis_service.is_calibrated():
+                        from services.config import state as _state
+                        total_steps = linear_axis_service.calibration_total_steps()
+                        if total_steps is None:
+                            axis_reason = "invalid calibration (total steps unavailable)"
+                            raise RuntimeError(axis_reason)
+                        try:
+                            off_top = float(d.get('offset_top_rot_px', d.get('offset_top_px', 0.0)) or 0.0)
+                        except Exception:
+                            off_top = 0.0
+                        st_axis = _state()
+                        top_fov_val = getattr(st_axis, "front_fov_top_px", None) or DEFAULT_FRONT_FOV_TOP_PX
+                        try:
+                            top_fov_val = float(top_fov_val)
+                        except (TypeError, ValueError):
+                            top_fov_val = 0.0
+                        if abs(top_fov_val) > 1e-3:
+                            delta_px = (off_top / top_fov_val) * FRONT_IMAGE_WIDTH_PX
+                            # Convert pixel offset into actuator steps using calibrated pixel-to-step factor.
+                            try:
+                                cfg = _state()
+                                home_steps = getattr(cfg, "linear_axis_home_steps", None)
+                                if home_steps is None:
+                                    home_steps = int(total_steps) // 2
+                            except Exception:
+                                home_steps = int(total_steps) // 2
+                            delta_steps = int(round(float(delta_px) * float(FRONT_STEPS_PER_PIXEL)))
+                            tgt_steps = int(home_steps) + int(delta_steps)
+                            target_steps = max(0, min(int(total_steps), int(tgt_steps)))
+                        else:
+                            axis_reason = "invalid front FOV"
+                    else:
+                        axis_reason = "linear axis not calibrated"
+                except Exception as ex:
+                    axis_reason = f"axis alignment failed: {ex}"
+
+                # Helpers for robust moves
+                def _axis_move_safe(target: int) -> dict:
+                    res = {"msg": None, "err": None}
+                    try:
+                        curr = linear_axis_service.current_position_steps()
+                    except Exception:
+                        curr = None
+                    if curr is not None and abs(int(curr) - int(target)) <= 2:
+                        res["msg"] = "[INFO] Already at requested position."
+                        return res
+                    try:
+                        move_res = linear_axis_service.goto_steps(int(target))
+                        if move_res.success:
+                            res["msg"] = move_res.message
+                        else:
+                            # Retry once if timed out
+                            low = (move_res.message or "").lower()
+                            if ("timed out" in low) or ("timeout" in low):
+                                retry = linear_axis_service.goto_steps(int(target))
+                                if retry.success:
+                                    res["msg"] = retry.message + " (retried)"
+                                else:
+                                    res["err"] = retry.message
+                            else:
+                                res["err"] = move_res.message
+                    except Exception as ex:
+                        res["err"] = str(ex)
+                    return res
+
+                def _tt_move_safe(delta_deg: float) -> dict:
+                    res = {"msg": None, "err": None}
+                    if abs(delta_deg) < 1e-3:
+                        res["msg"] = "[Turntable] Homing complete (already at zero)."
+                        return res
+                    try:
+                        msg = turntable_service.move_relative(delta_deg)
+                        res["msg"] = msg
+                    except Exception as ex:
+                        # Retry once
+                        try:
+                            msg = turntable_service.move_relative(delta_deg)
+                            res["msg"] = msg + " (retried)"
+                        except Exception as ex2:
+                            res["err"] = str(ex2)
+                    return res
+
+                # Fire moves concurrently
+                import threading
+                tt_res = {"msg": None, "err": None}
+                ax_res = {"msg": None, "err": axis_reason}
+
+                def _move_tt():
+                    r = _tt_move_safe(move_deg)
+                    tt_res.update(r)
+
+                def _move_axis():
+                    if target_steps is None:
+                        return
+                    r = _axis_move_safe(int(target_steps))
+                    ax_res.update(r)
+
+                threads = []
+                t1 = threading.Thread(target=_move_tt, daemon=True); threads.append(t1); t1.start()
+                if target_steps is not None:
+                    t2 = threading.Thread(target=_move_axis, daemon=True); threads.append(t2); t2.start()
+
+                for t in threads:
+                    t.join()
+
+                # Log results
+                if tt_res["err"]:
+                    self.tt_message.emit(f"[Step2] Rotate idx {idx} failed: {tt_res['err']}")
+                    continue
+                if tt_res["msg"]:
+                    self.tt_message.emit(f"[Step2] Rotate idx {idx}: {tt_res['msg']}")
+
+                if target_steps is None:
+                    if axis_reason:
+                        self.tt_message.emit(f"[Step2] Axis alignment skipped: {axis_reason}")
+                else:
+                    if ax_res["err"]:
+                        self.tt_message.emit(f"[Step2] Axis alignment failed: {ax_res['err']}")
+                    elif ax_res["msg"]:
+                        self.tt_message.emit(ax_res["msg"])
+
+                # Small dwell to allow motion to fully settle before imaging
+                try:
+                    time.sleep(0.1)
+                except Exception:
+                    pass
+
+                # Capture from cameras if available and update previews
+                try:
+                    top_snapshot = None
+                    # Top camera preview update (keep latest frame for debugging)
+                    if cammgr.is_connected("Top"):
+                        try:
+                            top_frame = cammgr.capture("Top")
+                            top_snapshot = self._ensure_bgr8(top_frame)
+                            _show_top(top_snapshot)
+                        except Exception as ex:
+                            top_snapshot = None
+                            self.tt_message.emit(f"[Step2] Top snapshot failed: {ex}")
+                    # Front camera preview, detect, correct, and crop
+                    if cammgr.is_connected("Front"):
+                        import cv2 as _cv2
+                        import numpy as _np
+                        from services.config import state as _state
+
+                        def _capture_front():
+                            frame = cammgr.capture("Front")
+                            return self._ensure_bgr8(frame)
+
+                        def _center_crop(img, crop_size):
+                            Hc, Wc = img.shape[:2]
+                            half = crop_size // 2
+                            cx = Wc // 2
+                            cy = Hc // 2
+                            x0 = max(0, cx - half); x1 = min(Wc, cx + half)
+                            y0 = max(0, cy - half); y1 = min(Hc, cy + half)
+                            crop = img[y0:y1, x0:x1].copy()
+                            if crop.shape[0] != crop_size or crop.shape[1] != crop_size:
+                                crop = _cv2.resize(crop, (crop_size, crop_size))
+                            return crop
+
+                        # first capture at current alignment
+                        overlay = _capture_front()
+                        initial_raw_path = None
+                        try:
+                            initial_raw_path = str(step2_dir / f"step-02_front_initial_{idx:03d}.png")
+                            _cv2.imwrite(initial_raw_path, overlay)
+                            self.tt_message.emit(f"[Step2] Saved initial front snapshot: {initial_raw_path}")
+                        except Exception:
+                            initial_raw_path = None
+
+                        try:
+                            st2 = _state(); crop_size = int(getattr(st2, 'step2_crop_size', None) or 1600)
+                        except Exception:
+                            crop_size = 1600
+                        crop = _center_crop(overlay, crop_size)
+                        initial_crop_path = str(step2_dir / f"step-02_front_crop_initial_{idx:03d}.png")
+                        try:
+                            _cv2.imwrite(initial_crop_path, crop)
+                        except Exception:
+                            pass
+
+                        # Run front detection on the initial crop
+                        dets = []
+                        try:
+                            dets = solvision_manager.detect_for('front', initial_crop_path)
+                        except Exception as ex:
+                            self.tt_message.emit(f"[Step2] Front detect failed: {ex}")
+                            dets = []
+
+                        if not dets:
+                            self.tt_message.emit(f"[Step2] No detection in crop idx {idx}; discarding filling.")
+                            continue
+
+                        # Pick detection closest to crop center
+                        cx_crop = crop.shape[1] / 2.0
+                        cy_crop = crop.shape[0] / 2.0
+                        def _center_of(det):
+                            b = det.get("bounds")
+                            if not b:
+                                return (None, None)
+                            x1, y1, w, h = b
+                            return (x1 + w / 2.0, y1 + h / 2.0)
+                        det = min(dets, key=lambda dd: float('inf') if _center_of(dd)[0] is None else abs(_center_of(dd)[0] - cx_crop) + abs(_center_of(dd)[1] - cy_crop))
+                        dcx, dcy = _center_of(det)
+                        if dcx is None:
+                            self.tt_message.emit(f"[Step2] Detection missing center; discarding idx {idx}.")
+                            continue
+                        dx_px = dcx - cx_crop  # + => bbox to the right of center
+                        # Convert pixel offset to actuator steps using front camera scale.
+                        try:
+                            total_steps = linear_axis_service.calibration_total_steps()
+                        except Exception:
+                            total_steps = None
+
+                        if not total_steps or total_steps <= 0:
+                            self.tt_message.emit("[Step2] Correction skipped: actuator calibration invalid (total steps unavailable).")
+                        else:
+                            try:
+                                curr_steps = linear_axis_service.current_position_steps()
+                            except Exception:
+                                curr_steps = None
+                            if curr_steps is None:
+                                try:
+                                    cfg = _state()
+                                    curr_steps = getattr(cfg, "linear_axis_home_steps", None)
+                                except Exception:
+                                    curr_steps = None
+                            if curr_steps is None:
+                                curr_steps = int(total_steps) // 2
+
+                            dx_steps = int(round(float(dx_px) * float(FRONT_STEPS_PER_PIXEL)))
+                            # Flip sign: bbox right of center -> move actuator left (negative delta)
+                            new_target = max(0, min(int(total_steps), int(curr_steps) - int(dx_steps)))
+                            tol_steps = max(1, int(round((0.05 / 100.0) * float(total_steps))))
+
+                            if abs(dx_steps) > tol_steps:
+                                try:
+                                    corr_res = _axis_move_safe(new_target)
+                                    if corr_res["err"]:
+                                        self.tt_message.emit(f"[Step2] Correction move failed: {corr_res['err']}")
+                                    elif corr_res["msg"]:
+                                        self.tt_message.emit(
+                                            f"{corr_res['msg']} (correction dx={dx_px:.2f}px -> {dx_steps} steps, new={new_target} steps)"
+                                        )
+                                except Exception as ex:
+                                    self.tt_message.emit(f"[Step2] Correction move failed: {ex}")
+                            else:
+                                self.tt_message.emit(
+                                    f"[Step2] Alignment within tolerance (dx={dx_px:.2f}px -> {dx_steps} steps); no correction move."
+                                )
+
+                        # Capture corrected frame after a short settle to avoid motion blur
+                        try:
+                            time.sleep(0.1)
+                        except Exception:
+                            pass
+                        # Capture corrected frame
+                        overlay = _capture_front()
+                        corrected_raw_path = None
+                        try:
+                            corrected_raw_path = str(step2_dir / f"step-02_front_corrected_{idx:03d}.png")
+                            _cv2.imwrite(corrected_raw_path, overlay)
+                            self.tt_message.emit(f"[Step2] Saved corrected front snapshot: {corrected_raw_path}")
+                        except Exception:
+                            corrected_raw_path = None
+
+                        H, W = overlay.shape[:2]
+                        x_mark = W // 2
+                        midy = H // 2
+                        try:
+                            _cv2.circle(overlay, (x_mark, midy), 8, (255, 0, 0), -1)
+                            _cv2.circle(overlay, (x_mark, midy), 8, (255, 255, 255), 2)
+                        except Exception:
+                            pass
+
+                        # Send front snapshot to the ledger (leave live preview untouched)
+                        try:
+                            pm_front = np_bgr_to_qpixmap(overlay)
+                            _show_front(pm_front)
+                        except Exception:
+                            pass
+
+                        # Save annotated and crop corrected center for downstream step 3
+                        try:
+                            fn_front = str(step2_dir / f"step-02_front_{idx:03d}.png")
+                            if _cv2.imwrite(fn_front, overlay):
+                                self.tt_message.emit(f"[Step2] Saved front snapshot (annotated): {fn_front}")
+                            else:
+                                self.tt_message.emit(f"[Step2] Failed to save front snapshot: {fn_front}")
+                        except Exception as ex:
+                            self.tt_message.emit(f"[Step2] Save failed: {ex}")
+
+                        try:
+                            crops_dir = step2_dir / 'step_2_cropped'
+                            crops_dir.mkdir(parents=True, exist_ok=True)
+                            try:
+                                st2 = _state(); crop_size = int(getattr(st2, 'step2_crop_size', None) or 1600)
+                            except Exception:
+                                crop_size = 1600
+                            raw_img = None
+                            try:
+                                if corrected_raw_path:
+                                    raw_img = _cv2.imread(corrected_raw_path)
+                            except Exception:
+                                raw_img = None
+                            if raw_img is None:
+                                raw_img = overlay.copy()
+                            crop_final = _center_crop(raw_img, crop_size)
+                            out_path = str(crops_dir / f"step-02_front_crop_{idx:03d}.png")
+                            _cv2.imwrite(out_path, crop_final)
+                            self.tt_message.emit(f"[Step2] Saved corrected crop: {out_path}")
+                            try:
+                                _submit_step3(out_path, idx)
+                            except Exception:
+                                pass
+                        except Exception as ex:
+                            self.tt_message.emit(f"[Step2] Crop failed: {ex}")
+
+                        # Clear preview markers so the next filling starts clean
+                        try:
+                            from PyQt5.QtCore import QTimer as _QTimer
+                            _QTimer.singleShot(0, lambda: self.preview_panel.set_front_markers([]))
+                        except Exception:
+                            pass
+
+                        # Save latest top snapshot alongside the front capture if available
+                        if top_snapshot is not None:
+                            try:
+                                fn_top = str(step2_dir / f"step-02_top_{idx:03d}.png")
+                                if _cv2.imwrite(fn_top, top_snapshot):
+                                    self.tt_message.emit(f"[Step2] Saved top snapshot: {fn_top}")
+                                else:
+                                    self.tt_message.emit(f"[Step2] Failed to save top snapshot: {fn_top}")
+                            except Exception as ex:
+                                self.tt_message.emit(f"[Step2] Top save failed: {ex}")
+
+                        _show_front(overlay)
+                    else:
+                        self.tt_message.emit("[Step2] Front camera not connected; snapshot skipped.")
+                except Exception as ex:
+                    self.tt_message.emit(f"[Step2] Snapshot failed: {ex}")
+
+            # Wait for any pipelined Step3/4 tasks; fall back to sequential if none were scheduled
+            try:
+                if bg_futures:
+                    try:
+                        while True:
+                            snapshot = list(bg_futures)
+                            pending = [f for f in snapshot if not f.done()]
+                            if not pending:
+                                break
+                            concurrent.futures.wait(pending, return_when=concurrent.futures.ALL_COMPLETED)
+                    except Exception:
+                        pass
+                    for fut in list(bg_futures):
+                        try:
+                            fut.result()
+                        except Exception as ex:
+                            try:
+                                self.tt_message.emit(f"[Step2] Background task failed: {ex}")
+                            except Exception:
+                                pass
+                else:
+                    # Backward-compatible sequential processing
+                    try:
+                        self._run_step3_front(step2_dir)
+                    except Exception as ex:
+                        self.tt_message.emit(f"[Step3] Failed: {ex}")
+                    try:
+                        self._run_step4_defect(step2_dir)
+                    except Exception as ex:
+                        self.tt_message.emit(f"[Step4] Failed: {ex}")
+            finally:
+                try:
+                    exec_bg.shutdown(wait=True)
+                except Exception:
+                    pass
+            # Fallback: ensure every bbox in step-03 has a step-04 result
+            try:
+                bbox_files = sorted(step3_dir.glob('step-03_front_bbox_*.png'))
+                for p in bbox_files:
+                    try:
+                        import re as _re
+                        m = _re.search(r"_(\d+)\.png$", p.name)
+                        idx_fallback = int(m.group(1)) if m else 0
+                    except Exception:
+                        idx_fallback = 0
+                    expected = step4_dir / f"step-04_defect_{idx_fallback:03d}.png"
+                    if expected.exists():
+                        continue
+                    try:
+                        self.tt_message.emit(f"[Step4] Fallback running idx {idx_fallback} from {p.name}")
+                    except Exception:
+                        pass
+                    try:
+                        self._process_step4_single(str(p), idx_fallback, step4_dir, defect_model, self._defect_thr_cached)
+                    except Exception as ex:
+                        try:
+                            self.tt_message.emit(f"[Step4] Fallback idx {idx_fallback} failed: {ex}")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            # Final sweep: rerun step-04 sequentially over all bboxes to guarantee outputs
+            try:
+                self._run_step4_defect(step2_dir)
+            except Exception as ex:
+                try:
+                    self.tt_message.emit(f"[Step4] Final sweep failed: {ex}")
+                except Exception:
+                    pass
+            # Home the turntable at the end
+            try:
+                res = turntable_service.home()
+                self.tt_message.emit(res.message)
+                status = res.message if res.success else f"Error: {res.message}"
+                self.tt_status.emit(status)
+            except Exception:
+                self.tt_message.emit("[Step2] Home failed.")
+            # Home linear axis using configured home position
+            try:
+                if linear_axis_service.is_connected() and linear_axis_service.is_calibrated():
+                    try:
+                        from services.config import state as _state
+                        cfg = _state()
+                        hs = getattr(cfg, "linear_axis_home_steps", None)
+                        if hs is None:
+                            total = linear_axis_service.calibration_total_steps()
+                            hs = (int(total) // 2) if total else 0
+                        home_steps = int(hs)
+                    except Exception:
+                        total = linear_axis_service.calibration_total_steps()
+                        home_steps = (int(total) // 2) if total else 0
+                    res_ax_home = linear_axis_service.home(home_steps=home_steps)
+                    self.tt_message.emit(res_ax_home.message)
+                else:
+                    self.tt_message.emit("[Step2] Axis home skipped (not connected/calibrated).")
+            except Exception as ex:
+                self.tt_message.emit(f"[Step2] Axis home failed: {ex}")
+            # Record cycle time from button press to post-home
+            try:
+                elapsed = time.time() - cycle_start
+                ct_path = Path(cap_dir) / "cycle_time.txt"
+                ct_path.parent.mkdir(parents=True, exist_ok=True)
+                with ct_path.open("a", encoding="ascii") as f:
+                    f.write(f"{elapsed:.2f}\n")
+                self.tt_message.emit(f"[Step2] Cycle time recorded: {elapsed:.2f} s -> {ct_path}")
+            except Exception as ex:
+                self.tt_message.emit(f"[Step2] Cycle time record failed: {ex}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---- Helpers ----
+    def _ensure_bgr8(self, img):
+        import numpy as _np
+        import cv2 as _cv2
+
+        if img is None:
+            return _np.zeros((10, 10, 3), dtype=_np.uint8)
+
+        arr = img
+        if arr.ndim == 2:
+            return _cv2.cvtColor(self._to_uint8(arr), _cv2.COLOR_GRAY2BGR)
+        if arr.ndim == 3 and arr.shape[2] == 1:
+            single = self._to_uint8(arr[:, :, 0])
+            return _cv2.cvtColor(single, _cv2.COLOR_GRAY2BGR)
+        if arr.ndim == 3 and arr.shape[2] >= 3:
+            if arr.dtype == _np.uint8:
+                return arr.copy()
+            channels = [self._to_uint8(arr[:, :, c]) for c in range(3)]
+            return _cv2.merge(channels)
+        return arr
+
+    def _to_uint8(self, channel):
+        import numpy as _np
+        arr = channel.astype(_np.float32, copy=False)
+        mn, mx = arr.min(), arr.max()
+        if mx - mn < 1e-6:
+            return _np.zeros_like(channel, dtype=_np.uint8)
+        norm = (arr - mn) / (mx - mn)
+        return (norm * 255.0).clip(0, 255).astype(_np.uint8)
+
+    def on_turntable_port_selected(self, port: str):
+        try:
+            host = str(port or "").strip()
+            if ":" in host and host.count(":") == 1:
+                host = host.split(":", 1)[0].strip()
+            st = state()
+            st.plc_host = host or None
+            st.turntable_step = float(self.workflow_tab.turntable_panel.step.value())
+            save_state()
+        except Exception:
+            pass
+
+    def on_turntable_step_changed(self, v: float):
+        st = state(); st.turntable_step = float(v); save_state()
+
+    def on_defect_threshold_changed(self, v: float):
+        try:
+            st = state()
+            st.defect_score_threshold = float(v)
+            save_state()
+            self.tt_message.emit(f"[Step4] Defect threshold updated to {float(v):.3f}")
+        except Exception:
+            pass
+
+    def _ensure_models_loaded(self, required=("top",), show_dialog=False) -> bool:
+        missing = []
+        try:
+            for name in required:
+                if solvision_manager.current_project_path_for(name) is None:
+                    missing.append(name)
+        except Exception:
+            missing = list(required)
+        if missing:
+            msg = f"Please load model(s): {', '.join(missing)} before running."
+            try:
+                if show_dialog:
+                    QMessageBox.information(self, "Models Required", msg)
+                else:
+                    self.workflow_tab.append_log(msg)
+            except Exception:
+                pass
+            return False
+        return True
+
+    def _on_tt_raw_message(self, msg: str):
+        # Called from service thread; relay to UI thread via signal
+        if msg:
+            self.tt_message.emit(msg)
+
+    def _on_plc_snapshot_raw(self, snap):
+        # Called from PLC poll thread; relay to UI thread via signal
+        try:
+            self.plc_snapshot.emit(snap)
+        except Exception:
+            pass
+
+    def _handle_plc_snapshot(self, snap):
+        """
+        Keep UI connection state in sync with the shared PLC service.
+        Note: Avoid spamming panel status labels on every poll; only update
+        when connection/calibration state changes.
+        """
+        try:
+            connected = bool(getattr(snap, "connected", False))
+            endpoint = plc_service.endpoint() or ""
+
+            if self._plc_connected_last is None or connected != self._plc_connected_last:
+                try:
+                    self.workflow_tab.turntable_panel.set_connected(connected, endpoint)
+                except Exception:
+                    pass
+                try:
+                    self.workflow_tab.linear_axis_panel.set_connected(connected, endpoint)
+                    self.workflow_tab.linear_axis_panel.set_ready(connected)
+                except Exception:
+                    pass
+                if connected:
+                    try:
+                        cfg = state()
+                        hs = getattr(cfg, "linear_axis_home_steps", None)
+                        if hs is None:
+                            hs = getattr(cfg, "linear_axis_last_steps", None)
+                        if hs is None:
+                            hs = 0
+                        self.workflow_tab.linear_axis_panel.set_home_steps(int(hs))
+                    except Exception:
+                        pass
+                if not connected:
+                    err = getattr(snap, "last_error", None) or "PLC disconnected."
+                    try:
+                        self.workflow_tab.turntable_panel.set_status(str(err))
+                    except Exception:
+                        pass
+                    try:
+                        self.workflow_tab.linear_axis_panel.set_status(str(err))
+                    except Exception:
+                        pass
+                    self._plc_axis_cal_last = None
+
+            self._plc_connected_last = connected
+
+            st = getattr(snap, "status", None)
+            if not connected or st is None:
+                return
+
+            # Surface PLC safety/health issues without spamming every poll.
+            try:
+                problems = []
+                if bool(getattr(st, "door_open", False)):
+                    problems.append("Door open")
+                if bool(getattr(st, "sys_halted", False)):
+                    problems.append("HALTED")
+                if bool(getattr(st, "sys_fault", False)):
+                    problems.append(f"FAULT code {int(getattr(st, 'sys_fault_code', 0) or 0)}")
+                if hasattr(st, "watchdog_ok") and not bool(getattr(st, "watchdog_ok", True)):
+                    problems.append("Watchdog not OK")
+                if hasattr(st, "allow_motion_active") and not bool(getattr(st, "allow_motion_active", True)):
+                    problems.append("ALLOW_MOTION off")
+
+                health = " | ".join(problems)
+                if health != self._plc_health_last:
+                    if health:
+                        msg = f"[PLC] {health}"
+                    else:
+                        msg = f"Connected ({endpoint})." if endpoint else "Connected."
+                    try:
+                        self.workflow_tab.turntable_panel.set_status(msg)
+                    except Exception:
+                        pass
+                    try:
+                        self.workflow_tab.linear_axis_panel.set_status(msg)
+                    except Exception:
+                        pass
+                    self._plc_health_last = health
+            except Exception:
+                pass
+
+            cal = bool(getattr(st, "act_calib_valid", False))
+            total = int(getattr(st, "act_calib_total_steps", 0) or 0)
+            pos_steps = int(getattr(st, "act_pos_steps", 0) or 0)
+            try:
+                act_target_steps = int(getattr(st, "act_target_steps", 0) or 0)
+            except Exception:
+                act_target_steps = None
+            try:
+                act_in_motion = bool(getattr(st, "act_in_motion", False))
+            except Exception:
+                act_in_motion = None
+            try:
+                act_state = int(getattr(st, "act_state", 0) or 0)
+            except Exception:
+                act_state = None

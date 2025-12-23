@@ -26,6 +26,8 @@ def settings() -> InitSettings:
 @dataclass
 class AppState:
     last_project_path: Optional[str] = None
+    last_front_project_path: Optional[str] = None
+    last_defect_project_path: Optional[str] = None
     last_image_path: Optional[str] = None
     attachment_path: Optional[str] = None
     front_attachment_path: Optional[str] = None
